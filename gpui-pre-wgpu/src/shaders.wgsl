@@ -1283,7 +1283,11 @@ fn fs_fill(input: FillVarying) -> @location(0) vec4<f32> {
         sprite.inverse_ab.y * p.x + sprite.inverse_ab.w * p.y + sprite.inverse_t.y,
     );
     var t = 0.0;
-    if (sprite.kind == 1u) {
+    if (sprite.kind == 3u) {
+        // A line: `centre` is where it starts and `radii` is the vector to where it ends.
+        let along = sprite.radii;
+        t = dot(q - sprite.centre, along) / max(dot(along, along), 0.0001);
+    } else if (sprite.kind == 1u) {
         let reach = max(abs(sprite.radii.y - sprite.radii.x), 0.0001);
         t = (length(q - sprite.centre) - sprite.radii.x) / (sprite.radii.y - sprite.radii.x + select(0.0, 0.0001, reach <= 0.0001));
     } else {

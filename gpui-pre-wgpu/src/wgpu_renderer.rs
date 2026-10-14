@@ -120,6 +120,21 @@ struct GroupSprite {
     pad: [u32; 2],
 }
 
+/// A plain copy of a surface over `bounds`: no blur, no colour matrix, full opacity.
+fn sprite_for(bounds: Bounds<ScaledPixels>) -> GroupSprite {
+    GroupSprite {
+        bounds,
+        opacity: 1.0,
+        has_matrix: 0,
+        blur: 0.0,
+        blur_axis: 0,
+        rows: [[0.0; 4]; 4],
+        offsets: [0.0; 4],
+        source_offset: [0.0, 0.0],
+        pad: [0, 0],
+    }
+}
+
 /// A gradient painted by the renderer's own pass. Mirrors `FillSprite` in `shaders.wgsl`.
 #[derive(Clone, Debug)]
 #[repr(C)]
@@ -143,6 +158,8 @@ fn fill_sprite(group: &gpui::Group, fill: &gpui::GradientFill) -> FillSprite {
     use gpui::{GradientExtend, GradientShape};
     let bounds = group.bounds.intersect(&group.content_mask.bounds);
     let (kind, centre, radii, angles) = match fill.shape {
+        // A line is kept in the centre and the radii: the start, and the vector to the end.
+        GradientShape::Linear { start, end } => (3, [start.0, start.1], [end.0 - start.0, end.1 - start.1], [0.0, 0.0]),
         GradientShape::Radial { centre, start_radius, end_radius } => {
             (1, [centre.0, centre.1], [start_radius, end_radius], [0.0, 0.0])
         }
@@ -303,11 +320,17 @@ struct WgpuResources {
     path_msaa_view: Option<wgpu::TextureView>,
     /// The surfaces groups are painted into, one for each depth of nesting, as large as the frame.
     group_textures: Vec<(wgpu::Texture, wgpu::TextureView)>,
+    /// The surface the root scene is painted into when a group of it filters its backdrop (the window's own
+    /// texture cannot be read): the frame is copied from it afterwards.
+    root_texture: Option<(wgpu::Texture, wgpu::TextureView)>,
 }
 
 impl WgpuResources {
     fn invalidate_intermediate_textures(&mut self) {
         for (texture, _) in self.group_textures.drain(..) {
+            texture.destroy();
+        }
+        if let Some((texture, _)) = self.root_texture.take() {
             texture.destroy();
         }
         self.path_intermediate_texture = None;
@@ -693,6 +716,7 @@ impl WgpuRenderer {
             path_msaa_texture: None,
             path_msaa_view: None,
             group_textures: Vec::new(),
+            root_texture: None,
         };
 
         Ok(Self {
@@ -1592,18 +1616,56 @@ impl WgpuRenderer {
                     label: Some("main_encoder"),
                 });
 
-        self.record_scene(
-            scene,
-            frame_view,
-            0,
-            &mut encoder,
-            &mut instance_offset,
-        )?;
+        if scene.groups.iter().any(|group| group.effects.backdrop.is_some()) {
+            // A group filters what is under it, which is read from its target: the window's texture cannot be.
+            // The root scene goes into a surface of its own and the frame is copied from it.
+            let root = self.root_view();
+            self.record_scene(scene, &root, 0, &mut encoder, &mut instance_offset)?;
+            let (width, height) = (self.surface_config.width as f32, self.surface_config.height as f32);
+            let whole = Bounds {
+                origin: gpui::point(ScaledPixels(0.0), ScaledPixels(0.0)),
+                size: gpui::size(ScaledPixels(width), ScaledPixels(height)),
+            };
+            let copy = GroupSprite {
+                bounds: whole,
+                opacity: 1.0,
+                has_matrix: 0,
+                blur: 0.0,
+                blur_axis: 0,
+                rows: [[0.0; 4]; 4],
+                offsets: [0.0; 4],
+                source_offset: [0.0, 0.0],
+                pad: [0, 0],
+            };
+            self.composite_group(
+                &mut encoder,
+                frame_view,
+                wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                &copy,
+                &root,
+                false,
+                &mut instance_offset,
+            )?;
+        } else {
+            self.record_scene(scene, frame_view, 0, &mut encoder, &mut instance_offset)?;
+        }
 
         self.resources()
             .queue
             .submit(std::iter::once(encoder.finish()));
         Ok(())
+    }
+
+    /// The surface the root scene is painted into, made when it is first needed.
+    fn root_view(&mut self) -> wgpu::TextureView {
+        let format = self.surface_config.format;
+        let (width, height) = (self.surface_config.width, self.surface_config.height);
+        let resources = self.resources_mut();
+        if resources.root_texture.is_none() {
+            resources.root_texture =
+                Some(Self::create_path_intermediate(&resources.device, format, width, height));
+        }
+        resources.root_texture.as_ref().map(|(_, view)| view.clone()).expect("the root surface")
     }
 
     /// The surface a group at `depth` is painted into, made when it is first needed.
@@ -1667,6 +1729,108 @@ impl WgpuRenderer {
         Ok(())
     }
 
+    /// Filters what `target` holds under the group's backdrop box (blur, then colour matrix), cuts it to the box's
+    /// shape, and puts it back in its place.
+    fn filter_backdrop(
+        &mut self,
+        group: &gpui::Group,
+        backdrop: &gpui::BackdropEffects,
+        target: &wgpu::TextureView,
+        depth: usize,
+        encoder: &mut wgpu::CommandEncoder,
+        instance_offset: &mut u64,
+    ) -> Result<()> {
+        let [x, y, width, height] = backdrop.rect;
+        let area = Bounds {
+            origin: gpui::point(ScaledPixels(x), ScaledPixels(y)),
+            size: gpui::size(ScaledPixels(width), ScaledPixels(height)),
+        }
+        .intersect(&group.content_mask.bounds);
+        if area.size.width.0 <= 0.0 || area.size.height.0 <= 0.0 {
+            return Ok(());
+        }
+        let identity = [
+            1.0, 0.0, 0.0, 0.0, 0.0, //
+            0.0, 1.0, 0.0, 0.0, 0.0, //
+            0.0, 0.0, 1.0, 0.0, 0.0, //
+            0.0, 0.0, 0.0, 1.0, 0.0,
+        ];
+        let m = backdrop.colour_matrix.unwrap_or(identity);
+        let sprite = GroupSprite {
+            bounds: area,
+            opacity: 1.0,
+            has_matrix: u32::from(backdrop.colour_matrix.is_some()),
+            blur: backdrop.blur.max(0.0),
+            blur_axis: 0,
+            rows: [
+                [m[0], m[1], m[2], m[3]],
+                [m[5], m[6], m[7], m[8]],
+                [m[10], m[11], m[12], m[13]],
+                [m[15], m[16], m[17], m[18]],
+            ],
+            offsets: [m[4], m[9], m[14], m[19]],
+            source_offset: [0.0, 0.0],
+            pad: [0, 0],
+        };
+        // The filtered copy of the backdrop is made in surfaces above the group's own.
+        let filtered = self.group_view(depth + 2);
+        if sprite.blur > 0.0 {
+            let scratch = self.group_view(depth + 1);
+            let first = GroupSprite { blur_axis: 1, has_matrix: 0, ..sprite.clone() };
+            self.composite_group(
+                encoder,
+                &scratch,
+                wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                &first,
+                target,
+                false,
+                instance_offset,
+            )?;
+            let last = GroupSprite { blur_axis: 2, ..sprite };
+            self.composite_group(
+                encoder,
+                &filtered,
+                wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                &last,
+                &scratch,
+                false,
+                instance_offset,
+            )?;
+        } else {
+            self.composite_group(
+                encoder,
+                &filtered,
+                wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                &sprite,
+                target,
+                false,
+                instance_offset,
+            )?;
+        }
+        let mut result = filtered;
+        if let Some(shape) = &group.backdrop_shape {
+            // The box has round corners: the copy is cut to them by the alpha of the shape.
+            let shape_view = self.group_view(depth + 3);
+            self.record_scene(shape, &shape_view, depth + 4, encoder, instance_offset)?;
+            let cut = self.group_view(depth + 1);
+            let plain = GroupSprite { has_matrix: 0, blur: 0.0, blur_axis: 0, ..sprite_for(area) };
+            self.composite_group(
+                encoder,
+                &cut,
+                wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                &plain,
+                &result,
+                false,
+                instance_offset,
+            )?;
+            self.composite_group(encoder, &cut, wgpu::LoadOp::Load, &plain, &shape_view, true, instance_offset)?;
+            result = cut;
+        }
+        // It replaces what was there: the copy is opaque where the target was.
+        let plain = sprite_for(area);
+        self.composite_group(encoder, target, wgpu::LoadOp::Load, &plain, &result, false, instance_offset)
+    }
+
     /// Clears `target` and paints a gradient into it.
     fn paint_fill(
         &mut self,
@@ -1713,6 +1877,9 @@ impl WgpuRenderer {
         encoder: &mut wgpu::CommandEncoder,
         instance_offset: &mut u64,
     ) -> Result<()> {
+        if let Some(backdrop) = group.effects.backdrop {
+            self.filter_backdrop(group, &backdrop, target, depth, encoder, instance_offset)?;
+        }
         let mut view = self.group_view(depth);
         if let Some(fill) = &group.fill {
             self.paint_fill(encoder, &view, &fill_sprite(group, fill), instance_offset)?;

@@ -76,6 +76,22 @@ pub struct GroupEffects {
     /// A shadow of the group's alpha, under the group, as the CSS `drop-shadow()` filter function makes one. It
     /// is the last thing done to the group: the group's own colour matrix and blur are not in it.
     pub drop_shadow: Option<DropShadow>,
+    /// A filter of what is behind the group, in a box, drawn before the group: the CSS `backdrop-filter`.
+    pub backdrop: Option<BackdropEffects>,
+}
+
+/// A blur and a colour matrix applied to what the target holds under a box, which then takes its place.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BackdropEffects {
+    /// The standard deviation of the blur, in logical pixels in [`Window::paint_group`](crate::Window::paint_group)
+    /// and in device pixels in a [`Group`].
+    pub blur: f32,
+    /// A colour matrix as in [`GroupEffects::colour_matrix`], applied after the blur.
+    pub colour_matrix: Option<[f32; 20]>,
+    /// The box: `[x, y, width, height]` in the units of `blur`.
+    pub rect: [f32; 4],
+    /// The radii of its corners: top left, top right, bottom right, bottom left, in the same units.
+    pub radii: [f32; 4],
 }
 
 /// The shadow of a group's shape: its alpha, moved by `offset`, blurred by `blur`, in one colour.
@@ -97,6 +113,7 @@ impl Default for GroupEffects {
             colour_matrix: None,
             blur: 0.0,
             drop_shadow: None,
+            backdrop: None,
         }
     }
 }
@@ -115,6 +132,13 @@ pub enum GradientExtend {
 /// The shape of a gradient that GPUI's own two stop linear one is not: colours that run out from a point or round it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum GradientShape {
+    /// Colours along the line from `start` to `end`, in gradient space: offset 0 is at `start` and 1 at `end`.
+    Linear {
+        /// Where offset 0 is.
+        start: (f32, f32),
+        /// Where offset 1 is.
+        end: (f32, f32),
+    },
     /// Colours at distances from `centre`, in the gradient's own space: the stop at 0 is `start_radius` away and the
     /// one at 1 is `end_radius` away.
     Radial {
@@ -171,6 +195,8 @@ pub struct Group {
     pub mask: Option<Arc<Scene>>,
     /// A group with a fill has no scene: the renderer paints this gradient over its bounds in the scene's place.
     pub fill: Option<Arc<GradientFill>>,
+    /// The shape of the box of `effects.backdrop`, a scene that paints it opaque, when its corners are round.
+    pub backdrop_shape: Option<Arc<Scene>>,
 }
 
 #[expect(missing_docs)]

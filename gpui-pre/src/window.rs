@@ -4433,12 +4433,35 @@ impl Window {
         });
         // A group on the scene is in device pixels: the blur and the shadow given in logical ones are scaled.
         let scale = self.scale_factor();
+        let backdrop_shape = effects.backdrop.filter(|b| b.radii.iter().any(|r| *r > 0.0)).map(|backdrop| {
+            let outer = std::mem::take(&mut self.next_frame.scene);
+            let bounds = Bounds::new(
+                point(px(backdrop.rect[0]), px(backdrop.rect[1])),
+                size(px(backdrop.rect[2]), px(backdrop.rect[3])),
+            );
+            let radii = Corners {
+                top_left: px(backdrop.radii[0]),
+                top_right: px(backdrop.radii[1]),
+                bottom_right: px(backdrop.radii[2]),
+                bottom_left: px(backdrop.radii[3]),
+            };
+            self.paint_quad(fill(bounds, crate::white()).corner_radii(radii));
+            let mut scene = std::mem::replace(&mut self.next_frame.scene, outer);
+            scene.finish();
+            std::sync::Arc::new(scene)
+        });
         let effects = crate::GroupEffects {
             blur: effects.blur * scale,
             drop_shadow: effects.drop_shadow.map(|shadow| crate::DropShadow {
                 offset: (shadow.offset.0 * scale, shadow.offset.1 * scale),
                 blur: shadow.blur * scale,
                 ..shadow
+            }),
+            backdrop: effects.backdrop.map(|backdrop| crate::BackdropEffects {
+                blur: backdrop.blur * scale,
+                rect: backdrop.rect.map(|v| v * scale),
+                radii: backdrop.radii.map(|v| v * scale),
+                ..backdrop
             }),
             ..effects
         };
@@ -4450,6 +4473,7 @@ impl Window {
             scene: std::sync::Arc::new(inner),
             mask,
             fill: None,
+            backdrop_shape,
         };
         self.next_frame.scene.insert_group(group);
         result
@@ -4497,6 +4521,7 @@ impl Window {
             scene: std::sync::Arc::new(Scene::default()),
             mask,
             fill: Some(std::sync::Arc::new(fill)),
+            backdrop_shape: None,
         };
         self.next_frame.scene.insert_group(group);
     }
