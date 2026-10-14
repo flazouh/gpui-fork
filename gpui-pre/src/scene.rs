@@ -73,6 +73,21 @@ pub struct GroupEffects {
     /// [`Window::paint_group`](crate::Window::paint_group) and in device pixels in a [`Group`] on the scene. Zero is
     /// no blur. The group's `bounds` must hold the blur's reach, about three times this on every side.
     pub blur: f32,
+    /// A shadow of the group's alpha, under the group, as the CSS `drop-shadow()` filter function makes one. It
+    /// is the last thing done to the group: the group's own colour matrix and blur are not in it.
+    pub drop_shadow: Option<DropShadow>,
+}
+
+/// The shadow of a group's shape: its alpha, moved by `offset`, blurred by `blur`, in one colour.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DropShadow {
+    /// How far the shadow is moved, in logical pixels as given to
+    /// [`Window::paint_group`](crate::Window::paint_group) and in device pixels in a [`Group`] on the scene.
+    pub offset: (f32, f32),
+    /// The standard deviation of the blur, in the same units.
+    pub blur: f32,
+    /// The colour of the shadow, straight (not premultiplied) red, green, blue and alpha in 0 to 1.
+    pub colour: [f32; 4],
 }
 
 impl Default for GroupEffects {
@@ -81,8 +96,61 @@ impl Default for GroupEffects {
             opacity: 1.0,
             colour_matrix: None,
             blur: 0.0,
+            drop_shadow: None,
         }
     }
+}
+
+/// How a gradient continues outside its range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GradientExtend {
+    /// The end colours go on.
+    Pad,
+    /// The gradient starts again.
+    Repeat,
+    /// The gradient runs backwards and forwards.
+    Reflect,
+}
+
+/// The shape of a gradient that GPUI's own two stop linear one is not: colours that run out from a point or round it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GradientShape {
+    /// Colours at distances from `centre`, in the gradient's own space: the stop at 0 is `start_radius` away and the
+    /// one at 1 is `end_radius` away.
+    Radial {
+        /// The centre, in gradient space.
+        centre: (f32, f32),
+        /// Where offset 0 is.
+        start_radius: f32,
+        /// Where offset 1 is.
+        end_radius: f32,
+    },
+    /// Colours at angles round `centre`: offset 0 is `start_angle` and 1 is `end_angle`, in radians, clockwise
+    /// from the direction of +x when y points down.
+    Sweep {
+        /// The centre, in gradient space.
+        centre: (f32, f32),
+        /// Where offset 0 is.
+        start_angle: f32,
+        /// Where offset 1 is.
+        end_angle: f32,
+    },
+}
+
+/// A gradient with any number of stops (up to 16) of a shape GPUI's own gradient does not have. It is painted by the
+/// renderer's own pass, with the stops' colours interpolated on premultiplied colours as CSS does.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GradientFill {
+    /// The shape.
+    pub shape: GradientShape,
+    /// How it goes on outside the range of its stops.
+    pub extend: GradientExtend,
+    /// The stops, in rising order of offset: where (0 to 1) and the straight red, green, blue and alpha.
+    pub stops: Vec<(f32, [f32; 4])>,
+    /// The affine map, `[a, b, c, d, e, f]` (`x' = a x + c y + e`, `y' = b x + d y + f`), from the window's
+    /// coordinates (logical pixels in [`Window::paint_gradient_fill`](crate::Window::paint_gradient_fill), device
+    /// pixels in a [`Group`]) to the gradient's space.
+    pub inverse: [f32; 6],
 }
 
 /// Content that is painted apart and composited as one. The renderer paints `scene` into a surface the size of the
@@ -98,6 +166,11 @@ pub struct Group {
     pub content_mask: ContentMask<ScaledPixels>,
     pub effects: GroupEffects,
     pub scene: Arc<Scene>,
+    /// What shows of the group is its alpha times the alpha of this scene (CSS `mask-image`), as the renderer
+    /// paints it into a surface of its own. `None` is no mask.
+    pub mask: Option<Arc<Scene>>,
+    /// A group with a fill has no scene: the renderer paints this gradient over its bounds in the scene's place.
+    pub fill: Option<Arc<GradientFill>>,
 }
 
 #[expect(missing_docs)]

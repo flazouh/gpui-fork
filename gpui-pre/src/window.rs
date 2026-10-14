@@ -4393,20 +4393,53 @@ impl Window {
         effects: crate::GroupEffects,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
+        self.paint_group_masked(bounds, effects, f, None::<fn(&mut Self)>)
+    }
+
+    /// [`Window::paint_group`] with a mask: what `mask` paints is a second scene, and the group shows where that is
+    /// opaque, in proportion to its alpha (CSS `mask-image` with an alpha mask). `bounds` is the area both cover.
+    pub fn paint_group_masked<R>(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        effects: crate::GroupEffects,
+        f: impl FnOnce(&mut Self) -> R,
+        mask: Option<impl FnOnce(&mut Self)>,
+    ) -> R {
         self.invalidator.debug_assert_paint();
 
         let content_mask = self.content_mask();
         let covered = bounds.intersect(&content_mask.bounds);
         if covered.is_empty() {
-            return f(self);
+            // Nothing of the group shows. Its closures still run, because the caller reads its content and its mask
+            // as it goes, but what they paint is thrown away.
+            let outer = std::mem::take(&mut self.next_frame.scene);
+            let result = f(self);
+            if let Some(paint) = mask {
+                paint(self);
+            }
+            self.next_frame.scene = outer;
+            return result;
         }
         let outer = std::mem::take(&mut self.next_frame.scene);
         let result = f(self);
         let mut inner = std::mem::replace(&mut self.next_frame.scene, outer);
         inner.finish();
-        // A group on the scene is in device pixels: the blur given in logical ones is scaled.
+        let mask = mask.map(|paint| {
+            let outer = std::mem::take(&mut self.next_frame.scene);
+            paint(self);
+            let mut scene = std::mem::replace(&mut self.next_frame.scene, outer);
+            scene.finish();
+            std::sync::Arc::new(scene)
+        });
+        // A group on the scene is in device pixels: the blur and the shadow given in logical ones are scaled.
+        let scale = self.scale_factor();
         let effects = crate::GroupEffects {
-            blur: effects.blur * self.scale_factor(),
+            blur: effects.blur * scale,
+            drop_shadow: effects.drop_shadow.map(|shadow| crate::DropShadow {
+                offset: (shadow.offset.0 * scale, shadow.offset.1 * scale),
+                blur: shadow.blur * scale,
+                ..shadow
+            }),
             ..effects
         };
         let group = crate::Group {
@@ -4415,9 +4448,57 @@ impl Window {
             content_mask: self.snapped_content_mask(),
             effects,
             scene: std::sync::Arc::new(inner),
+            mask,
+            fill: None,
         };
         self.next_frame.scene.insert_group(group);
         result
+    }
+
+    /// Paints `fill`, a gradient of a shape GPUI's own gradient does not have (radial, sweep) with any number of
+    /// stops, over `bounds` with rounded corners. `fill.inverse` takes the window's logical pixels to the
+    /// gradient's own space.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_gradient_fill(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        mut fill: crate::GradientFill,
+    ) {
+        self.invalidator.debug_assert_paint();
+
+        let content_mask = self.content_mask();
+        let covered = bounds.intersect(&content_mask.bounds);
+        if covered.is_empty() {
+            return;
+        }
+        // The group is in device pixels: the map is composed with the scale.
+        let scale = self.scale_factor();
+        for value in &mut fill.inverse[..4] {
+            *value /= scale;
+        }
+        let rounded = corner_radii.top_left > px(0.0)
+            || corner_radii.top_right > px(0.0)
+            || corner_radii.bottom_left > px(0.0)
+            || corner_radii.bottom_right > px(0.0);
+        let mask = rounded.then(|| {
+            let outer = std::mem::take(&mut self.next_frame.scene);
+            self.paint_quad(crate::fill(bounds, crate::white()).corner_radii(corner_radii));
+            let mut scene = std::mem::replace(&mut self.next_frame.scene, outer);
+            scene.finish();
+            std::sync::Arc::new(scene)
+        });
+        let group = crate::Group {
+            order: 0,
+            bounds: self.cover_bounds(covered),
+            content_mask: self.snapped_content_mask(),
+            effects: crate::GroupEffects::default(),
+            scene: std::sync::Arc::new(Scene::default()),
+            mask,
+            fill: Some(std::sync::Arc::new(fill)),
+        };
+        self.next_frame.scene.insert_group(group);
     }
 
     /// Paint the drop (non-inset) shadows from `shadows` into the scene at the current

@@ -115,6 +115,65 @@ struct GroupSprite {
     rows: [[f32; 4]; 4],
     /// The fifth column of the matrix: what is added to red, green, blue and alpha.
     offsets: [f32; 4],
+    /// How far the surface is read from the place it is drawn at, in device pixels: a shadow is the group moved.
+    source_offset: [f32; 2],
+    pad: [u32; 2],
+}
+
+/// A gradient painted by the renderer's own pass. Mirrors `FillSprite` in `shaders.wgsl`.
+#[derive(Clone, Debug)]
+#[repr(C)]
+struct FillSprite {
+    bounds: Bounds<ScaledPixels>,
+    kind: u32,
+    extend_mode: u32,
+    stop_count: u32,
+    pad0: u32,
+    inverse_ab: [f32; 4],
+    inverse_t: [f32; 2],
+    centre: [f32; 2],
+    radii: [f32; 2],
+    angles: [f32; 2],
+    stop_offsets: [f32; 16],
+    stop_colours: [[f32; 4]; 16],
+}
+
+/// The instance that paints `group`'s gradient over its area.
+fn fill_sprite(group: &gpui::Group, fill: &gpui::GradientFill) -> FillSprite {
+    use gpui::{GradientExtend, GradientShape};
+    let bounds = group.bounds.intersect(&group.content_mask.bounds);
+    let (kind, centre, radii, angles) = match fill.shape {
+        GradientShape::Radial { centre, start_radius, end_radius } => {
+            (1, [centre.0, centre.1], [start_radius, end_radius], [0.0, 0.0])
+        }
+        GradientShape::Sweep { centre, start_angle, end_angle } => {
+            (2, [centre.0, centre.1], [0.0, 0.0], [start_angle, end_angle])
+        }
+    };
+    let mut stop_offsets = [0.0f32; 16];
+    let mut stop_colours = [[0.0f32; 4]; 16];
+    for (at, (offset, colour)) in fill.stops.iter().take(16).enumerate() {
+        stop_offsets[at] = *offset;
+        stop_colours[at] = *colour;
+    }
+    FillSprite {
+        bounds,
+        kind,
+        extend_mode: match fill.extend {
+            GradientExtend::Pad => 0,
+            GradientExtend::Repeat => 1,
+            GradientExtend::Reflect => 2,
+        },
+        stop_count: fill.stops.len().min(16) as u32,
+        pad0: 0,
+        inverse_ab: [fill.inverse[0], fill.inverse[1], fill.inverse[2], fill.inverse[3]],
+        inverse_t: [fill.inverse[4], fill.inverse[5]],
+        centre,
+        radii,
+        angles,
+        stop_offsets,
+        stop_colours,
+    }
 }
 
 /// The instance that composites `group`: where, with what opacity and which colour matrix.
@@ -140,6 +199,8 @@ fn group_sprite(group: &gpui::Group) -> GroupSprite {
             [m[15], m[16], m[17], m[18]],
         ],
         offsets: [m[4], m[9], m[14], m[19]],
+        source_offset: [0.0, 0.0],
+        pad: [0, 0],
     }
 }
 
@@ -170,6 +231,10 @@ struct WgpuPipelines {
     path_rasterization: wgpu::RenderPipeline,
     paths: wgpu::RenderPipeline,
     groups: wgpu::RenderPipeline,
+    /// The same pass, blended as `destination * source alpha`: what a mask and the colour of a shadow are made with.
+    groups_multiply: wgpu::RenderPipeline,
+    /// A gradient painted by a pass of its own: see `FillSprite`.
+    fills: wgpu::RenderPipeline,
     underlines: wgpu::RenderPipeline,
     mono_sprites: wgpu::RenderPipeline,
     subpixel_sprites: Option<wgpu::RenderPipeline>,
@@ -1035,6 +1100,52 @@ impl WgpuRenderer {
             &shader_module,
         );
 
+        let multiply_blend = wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::Zero,
+                dst_factor: wgpu::BlendFactor::SrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::Zero,
+                dst_factor: wgpu::BlendFactor::SrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            },
+        };
+        let groups_multiply = create_pipeline(
+            "groups_multiply",
+            "vs_group",
+            "fs_group",
+            &layouts.globals,
+            &layouts.instances,
+            Some(&layouts.texture),
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: Some(multiply_blend),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            1,
+            &shader_module,
+        );
+
+        let fills = create_pipeline(
+            "fills",
+            "vs_fill",
+            "fs_fill",
+            &layouts.globals,
+            &layouts.instances,
+            None,
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: Some(paths_blend),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            1,
+            &shader_module,
+        );
+
         let underlines = create_pipeline(
             "underlines",
             "vs_underline",
@@ -1127,6 +1238,8 @@ impl WgpuRenderer {
             path_rasterization,
             paths,
             groups,
+            groups_multiply,
+            fills,
             underlines,
             mono_sprites,
             subpixel_sprites,
@@ -1515,6 +1628,7 @@ impl WgpuRenderer {
         load: wgpu::LoadOp<wgpu::Color>,
         sprite: &GroupSprite,
         source: &wgpu::TextureView,
+        multiply: bool,
         instance_offset: &mut u64,
     ) -> Result<()> {
         let instances = self.write_instance_binding(
@@ -1538,7 +1652,11 @@ impl WgpuRenderer {
             ..Default::default()
         });
         let resources = self.resources();
-        pass.set_pipeline(&resources.pipelines.groups);
+        pass.set_pipeline(if multiply {
+            &resources.pipelines.groups_multiply
+        } else {
+            &resources.pipelines.groups
+        });
         pass.set_bind_group(0, &resources.globals_bind_group, &[]);
         pass.set_bind_group(1, &instances.bind_group, &[]);
         pass.set_bind_group(2, &texture, &[]);
@@ -1546,6 +1664,145 @@ impl WgpuRenderer {
             0..4,
             instances.first_instance..instances.first_instance + 1,
         );
+        Ok(())
+    }
+
+    /// Clears `target` and paints a gradient into it.
+    fn paint_fill(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        sprite: &FillSprite,
+        instance_offset: &mut u64,
+    ) -> Result<()> {
+        let instances = self.write_instance_binding(
+            "fill_sprites_bind_group",
+            instance_offset,
+            std::slice::from_ref(sprite),
+        )?;
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("fill_pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            ..Default::default()
+        });
+        let resources = self.resources();
+        pass.set_pipeline(&resources.pipelines.fills);
+        pass.set_bind_group(0, &resources.globals_bind_group, &[]);
+        pass.set_bind_group(1, &instances.bind_group, &[]);
+        pass.draw(0..4, instances.first_instance..instances.first_instance + 1);
+        Ok(())
+    }
+
+    /// Paints one group of a scene onto `target`: its content into a surface of its own (one a depth, with the
+    /// surfaces above it for the mask, the shadow and the blur), the mask applied when it has one, the shadow under
+    /// it when it has one, and the content with its blur, its colour matrix and its opacity.
+    fn composite_scene_group(
+        &mut self,
+        group: &gpui::Group,
+        target: &wgpu::TextureView,
+        depth: usize,
+        encoder: &mut wgpu::CommandEncoder,
+        instance_offset: &mut u64,
+    ) -> Result<()> {
+        let mut view = self.group_view(depth);
+        if let Some(fill) = &group.fill {
+            self.paint_fill(encoder, &view, &fill_sprite(group, fill), instance_offset)?;
+        } else {
+            self.record_scene(&group.scene, &view, depth + 1, encoder, instance_offset)?;
+        }
+        let sprite = group_sprite(group);
+        if let Some(mask) = &group.mask {
+            // The mask is painted into the surface above, then the content is copied to another and multiplied
+            // by the mask's alpha there.
+            let mask_view = self.group_view(depth + 1);
+            self.record_scene(mask, &mask_view, depth + 2, encoder, instance_offset)?;
+            let masked = self.group_view(depth + 4);
+            let copy = GroupSprite { opacity: 1.0, has_matrix: 0, blur: 0.0, blur_axis: 0, ..sprite.clone() };
+            self.composite_group(
+                encoder,
+                &masked,
+                wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                &copy,
+                &view,
+                false,
+                instance_offset,
+            )?;
+            self.composite_group(encoder, &masked, wgpu::LoadOp::Load, &copy, &mask_view, true, instance_offset)?;
+            view = masked;
+        }
+        if let Some(shadow) = group.effects.drop_shadow {
+            // The shadow is the content's alpha, moved and blurred, in one colour: the surface is cleared to the
+            // colour and the alpha is multiplied in.
+            let mut source = view.clone();
+            let plain = GroupSprite { opacity: 1.0, has_matrix: 0, blur: 0.0, blur_axis: 0, ..sprite.clone() };
+            if shadow.blur > 0.0 {
+                let scratch = self.group_view(depth + 1);
+                let blurred = self.group_view(depth + 2);
+                let first = GroupSprite { blur: shadow.blur, blur_axis: 1, ..plain.clone() };
+                self.composite_group(
+                    encoder,
+                    &scratch,
+                    wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    &first,
+                    &view,
+                    false,
+                    instance_offset,
+                )?;
+                let last = GroupSprite { blur: shadow.blur, blur_axis: 2, ..plain.clone() };
+                self.composite_group(
+                    encoder,
+                    &blurred,
+                    wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    &last,
+                    &scratch,
+                    false,
+                    instance_offset,
+                )?;
+                source = blurred;
+            }
+            let tinted = self.group_view(depth + 3);
+            let [r, g, b, a] = shadow.colour;
+            let moved = GroupSprite { source_offset: [shadow.offset.0, shadow.offset.1], ..plain.clone() };
+            self.composite_group(
+                encoder,
+                &tinted,
+                wgpu::LoadOp::Clear(wgpu::Color { r: r as f64, g: g as f64, b: b as f64, a: 1.0 }),
+                &moved,
+                &source,
+                true,
+                instance_offset,
+            )?;
+            let faint = GroupSprite { opacity: a.clamp(0.0, 1.0), ..plain };
+            self.composite_group(encoder, target, wgpu::LoadOp::Load, &faint, &tinted, false, instance_offset)?;
+        }
+        if sprite.blur > 0.0 {
+            // A blur is two passes: along x into a scratch surface, then along y onto the target with the colour
+            // matrix and the opacity.
+            let scratch = self.group_view(depth + 1);
+            let first = GroupSprite { blur_axis: 1, opacity: 1.0, has_matrix: 0, ..sprite.clone() };
+            self.composite_group(
+                encoder,
+                &scratch,
+                wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                &first,
+                &view,
+                false,
+                instance_offset,
+            )?;
+            let last = GroupSprite { blur_axis: 2, ..sprite };
+            self.composite_group(encoder, target, wgpu::LoadOp::Load, &last, &scratch, false, instance_offset)?;
+        } else {
+            self.composite_group(encoder, target, wgpu::LoadOp::Load, &sprite, &view, false, instance_offset)?;
+        }
         Ok(())
     }
 
@@ -1677,56 +1934,7 @@ impl WgpuRenderer {
                     PrimitiveBatch::Groups(range) => {
                         drop(pass);
                         for group in &scene.groups[range] {
-                            // The group is painted into a surface of its own, then composited here.
-                            let view = self.group_view(depth);
-                            self.record_scene(
-                                &group.scene,
-                                &view,
-                                depth + 1,
-                                encoder,
-                                instance_offset,
-                            )?;
-                            let sprite = group_sprite(group);
-                            if sprite.blur > 0.0 {
-                                // A blur is two passes: along x into a scratch surface, then along y onto the target
-                                // with the colour matrix and the opacity.
-                                let scratch = self.group_view(depth + 1);
-                                let first = GroupSprite {
-                                    blur_axis: 1,
-                                    opacity: 1.0,
-                                    has_matrix: 0,
-                                    ..sprite.clone()
-                                };
-                                self.composite_group(
-                                    encoder,
-                                    &scratch,
-                                    wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                                    &first,
-                                    &view,
-                                    instance_offset,
-                                )?;
-                                let last = GroupSprite {
-                                    blur_axis: 2,
-                                    ..sprite
-                                };
-                                self.composite_group(
-                                    encoder,
-                                    target,
-                                    wgpu::LoadOp::Load,
-                                    &last,
-                                    &scratch,
-                                    instance_offset,
-                                )?;
-                            } else {
-                                self.composite_group(
-                                    encoder,
-                                    target,
-                                    wgpu::LoadOp::Load,
-                                    &sprite,
-                                    &view,
-                                    instance_offset,
-                                )?;
-                            }
+                            self.composite_scene_group(group, target, depth, encoder, instance_offset)?;
                         }
                         pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                             label: Some("main_pass_continued"),
@@ -2453,7 +2661,8 @@ mod tests {
         assert_eq!(std::mem::size_of::<Shadow>(), 28 * 4);
         assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 26 * 4);
         assert_eq!(std::mem::size_of::<PathSprite>(), 4 * 4);
-        assert_eq!(std::mem::size_of::<GroupSprite>(), 28 * 4);
+        assert_eq!(std::mem::size_of::<GroupSprite>(), 32 * 4);
+        assert_eq!(std::mem::size_of::<FillSprite>(), 100 * 4);
         assert_eq!(std::mem::size_of::<Underline>(), 16 * 4);
         assert_eq!(std::mem::size_of::<MonochromeSprite>(), 28 * 4);
         assert_eq!(std::mem::size_of::<SubpixelSprite>(), 28 * 4);

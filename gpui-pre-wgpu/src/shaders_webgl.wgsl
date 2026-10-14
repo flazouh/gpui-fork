@@ -222,7 +222,7 @@ fn load_path_sprite(instance_id: u32) -> PathSprite {
 }
 
 fn load_group_sprite(instance_id: u32) -> GroupSprite {
-    var cursor = instance_cursor(instance_id * 28u);
+    var cursor = instance_cursor(instance_id * 32u);
     let bounds = read_bounds(&cursor);
     let opacity = read_f32(&cursor);
     let has_matrix = read_word(&cursor);
@@ -233,11 +233,44 @@ fn load_group_sprite(instance_id: u32) -> GroupSprite {
     let b0 = read_f32(&cursor); let b1 = read_f32(&cursor); let b2 = read_f32(&cursor); let b3 = read_f32(&cursor);
     let a0 = read_f32(&cursor); let a1 = read_f32(&cursor); let a2 = read_f32(&cursor); let a3 = read_f32(&cursor);
     let o0 = read_f32(&cursor); let o1 = read_f32(&cursor); let o2 = read_f32(&cursor); let o3 = read_f32(&cursor);
+    let s0 = read_f32(&cursor); let s1 = read_f32(&cursor);
+    let pad0 = read_word(&cursor);
+    let pad1 = read_word(&cursor);
     return GroupSprite(
         bounds, opacity, has_matrix, blur, blur_axis,
         vec4<f32>(r0, r1, r2, r3), vec4<f32>(g0, g1, g2, g3),
         vec4<f32>(b0, b1, b2, b3), vec4<f32>(a0, a1, a2, a3),
         vec4<f32>(o0, o1, o2, o3),
+        vec2<f32>(s0, s1), pad0, pad1,
+    );
+}
+
+fn load_fill_sprite(instance_id: u32) -> FillSprite {
+    var cursor = instance_cursor(instance_id * 100u);
+    let bounds = read_bounds(&cursor);
+    let kind = read_word(&cursor);
+    let extend_mode = read_word(&cursor);
+    let stop_count = read_word(&cursor);
+    let pad0 = read_word(&cursor);
+    let ab0 = read_f32(&cursor); let ab1 = read_f32(&cursor); let ab2 = read_f32(&cursor); let ab3 = read_f32(&cursor);
+    let t0 = read_f32(&cursor); let t1 = read_f32(&cursor);
+    let c0 = read_f32(&cursor); let c1 = read_f32(&cursor);
+    let r0 = read_f32(&cursor); let r1 = read_f32(&cursor);
+    let g0 = read_f32(&cursor); let g1 = read_f32(&cursor);
+    var offsets = array<vec4<f32>, 4>();
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        let a = read_f32(&cursor); let b = read_f32(&cursor); let c = read_f32(&cursor); let d = read_f32(&cursor);
+        offsets[i] = vec4<f32>(a, b, c, d);
+    }
+    var colours = array<vec4<f32>, 16>();
+    for (var i = 0u; i < 16u; i = i + 1u) {
+        let a = read_f32(&cursor); let b = read_f32(&cursor); let c = read_f32(&cursor); let d = read_f32(&cursor);
+        colours[i] = vec4<f32>(a, b, c, d);
+    }
+    return FillSprite(
+        bounds, kind, extend_mode, stop_count, pad0,
+        vec4<f32>(ab0, ab1, ab2, ab3), vec2<f32>(t0, t1), vec2<f32>(c0, c1), vec2<f32>(r0, r1), vec2<f32>(g0, g1),
+        offsets, colours,
     );
 }
 

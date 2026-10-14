@@ -1159,6 +1159,9 @@ struct GroupSprite {
     row_b: vec4<f32>,
     row_a: vec4<f32>,
     offsets: vec4<f32>,
+    source_offset: vec2<f32>,
+    pad0: u32,
+    pad1: u32,
 }
 
 struct GroupVarying {
@@ -1176,7 +1179,7 @@ fn vs_group(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) inst
 
     var out = GroupVarying();
     out.position = device_position;
-    out.texture_coords = screen_position / globals.viewport_size;
+    out.texture_coords = (screen_position - sprite.source_offset) / globals.viewport_size;
     out.group_id = instance_id;
     return out;
 }
@@ -1229,6 +1232,99 @@ fn fs_group(input: GroupVarying) -> @location(0) vec4<f32> {
         colour = vec4<f32>(moved.rgb * moved.a, moved.a);
     }
     return colour * sprite.opacity;
+}
+
+// --- gradient fills --- //
+
+// A gradient of a shape GPUI's own two stop gradient is not: radial or sweep, with up to 16 stops. The colours are
+// straight; they are premultiplied here and interpolated as CSS does.
+struct FillSprite {
+    bounds: Bounds,
+    kind: u32,
+    extend_mode: u32,
+    stop_count: u32,
+    pad0: u32,
+    inverse_ab: vec4<f32>,
+    inverse_t: vec2<f32>,
+    centre: vec2<f32>,
+    radii: vec2<f32>,
+    angles: vec2<f32>,
+    stop_offsets: array<vec4<f32>, 4>,
+    stop_colours: array<vec4<f32>, 16>,
+}
+
+struct FillVarying {
+    @builtin(position) position: vec4<f32>,
+    @location(0) device: vec2<f32>,
+    @location(1) @interpolate(flat) fill_id: u32,
+}
+
+@vertex
+fn vs_fill(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> FillVarying {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    let sprite = load_fill_sprite(instance_id);
+    var out = FillVarying();
+    out.position = to_device_position(unit_vertex, sprite.bounds);
+    out.device = sprite.bounds.origin + unit_vertex * sprite.bounds.size;
+    out.fill_id = instance_id;
+    return out;
+}
+
+fn fill_stop_offset(sprite: FillSprite, index: u32) -> f32 {
+    return sprite.stop_offsets[index / 4u][index % 4u];
+}
+
+@fragment
+fn fs_fill(input: FillVarying) -> @location(0) vec4<f32> {
+    let sprite = load_fill_sprite(input.fill_id);
+    let p = input.device;
+    let q = vec2<f32>(
+        sprite.inverse_ab.x * p.x + sprite.inverse_ab.z * p.y + sprite.inverse_t.x,
+        sprite.inverse_ab.y * p.x + sprite.inverse_ab.w * p.y + sprite.inverse_t.y,
+    );
+    var t = 0.0;
+    if (sprite.kind == 1u) {
+        let reach = max(abs(sprite.radii.y - sprite.radii.x), 0.0001);
+        t = (length(q - sprite.centre) - sprite.radii.x) / (sprite.radii.y - sprite.radii.x + select(0.0, 0.0001, reach <= 0.0001));
+    } else {
+        let tau = 6.283185307179586;
+        var angle = atan2(q.y - sprite.centre.y, q.x - sprite.centre.x) - sprite.angles.x;
+        angle = angle - floor(angle / tau) * tau;
+        t = angle / max(sprite.angles.y - sprite.angles.x, 0.0001);
+    }
+    if (sprite.extend_mode == 1u) {
+        t = t - floor(t);
+    } else if (sprite.extend_mode == 2u) {
+        let u = t - 2.0 * floor(t / 2.0);
+        t = select(u, 2.0 - u, u > 1.0);
+    }
+    let count = sprite.stop_count;
+    t = clamp(t, 0.0, 1.0);
+    var colour = sprite.stop_colours[0];
+    colour = vec4<f32>(colour.rgb * colour.a, colour.a);
+    var i = 0u;
+    loop {
+        if (i + 1u >= count) { break; }
+        let from_offset = fill_stop_offset(sprite, i);
+        let to_offset = fill_stop_offset(sprite, i + 1u);
+        if (t >= from_offset && t <= to_offset) {
+            let span = to_offset - from_offset;
+            var along = 0.0;
+            if (span > 0.00001) {
+                along = (t - from_offset) / span;
+            }
+            let a = sprite.stop_colours[i];
+            let b = sprite.stop_colours[i + 1u];
+            colour = mix(vec4<f32>(a.rgb * a.a, a.a), vec4<f32>(b.rgb * b.a, b.a), along);
+            break;
+        }
+        if (t > to_offset) {
+            let b = sprite.stop_colours[i + 1u];
+            colour = vec4<f32>(b.rgb * b.a, b.a);
+        }
+        i = i + 1u;
+    }
+    return colour;
 }
 
 // --- underlines --- //

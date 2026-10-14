@@ -10,6 +10,7 @@
 @group(1) @binding(0) var<storage, read> b_path_vertices: array<PathRasterizationVertex>;
 @group(1) @binding(0) var<storage, read> b_path_sprites: array<PathSprite>;
 @group(1) @binding(0) var<storage, read> b_group_sprites: array<GroupSprite>;
+@group(1) @binding(0) var<storage, read> b_fill_sprites: array<FillSprite>;
 @group(1) @binding(0) var<storage, read> b_underlines: array<Underline>;
 @group(1) @binding(0) var<storage, read> b_mono_sprites: array<MonochromeSprite>;
 @group(1) @binding(0) var<storage, read> b_poly_sprites: array<PolychromeSprite>;
@@ -32,6 +33,10 @@ fn load_path_sprite(instance_id: u32) -> PathSprite {
 
 fn load_group_sprite(instance_id: u32) -> GroupSprite {
     return b_group_sprites[instance_id];
+}
+
+fn load_fill_sprite(instance_id: u32) -> FillSprite {
+    return b_fill_sprites[instance_id];
 }
 
 fn load_underline(instance_id: u32) -> Underline {
