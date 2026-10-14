@@ -9,6 +9,7 @@
 @group(1) @binding(0) var<storage, read> b_shadows: array<Shadow>;
 @group(1) @binding(0) var<storage, read> b_path_vertices: array<PathRasterizationVertex>;
 @group(1) @binding(0) var<storage, read> b_path_sprites: array<PathSprite>;
+@group(1) @binding(0) var<storage, read> b_group_sprites: array<GroupSprite>;
 @group(1) @binding(0) var<storage, read> b_underlines: array<Underline>;
 @group(1) @binding(0) var<storage, read> b_mono_sprites: array<MonochromeSprite>;
 @group(1) @binding(0) var<storage, read> b_poly_sprites: array<PolychromeSprite>;
@@ -27,6 +28,10 @@ fn load_path_vertex(vertex_id: u32) -> PathRasterizationVertex {
 
 fn load_path_sprite(instance_id: u32) -> PathSprite {
     return b_path_sprites[instance_id];
+}
+
+fn load_group_sprite(instance_id: u32) -> GroupSprite {
+    return b_group_sprites[instance_id];
 }
 
 fn load_underline(instance_id: u32) -> Underline {

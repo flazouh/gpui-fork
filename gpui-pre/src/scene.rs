@@ -13,6 +13,7 @@ use std::{
     iter::Peekable,
     ops::{Add, Range, Sub},
     slice,
+    sync::Arc,
 };
 
 #[allow(non_camel_case_types, unused)]
@@ -50,6 +51,53 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    /// Content painted apart and put on the scene as one: see [`Group`].
+    pub groups: Vec<Group>,
+}
+
+/// What a [`Group`] does to its content when it is put on the scene.
+///
+/// The content is painted into a surface of its own, then this is applied to that surface as a whole and the result
+/// is composited over what is under it. That is what a browser does for `opacity` below one: two shapes that overlap
+/// in a group show as one surface, which giving each shape the opacity cannot do.
+#[derive(Clone, Debug, PartialEq)]
+
+pub struct GroupEffects {
+    /// The group's opacity, from 0 to 1.
+    pub opacity: f32,
+    /// A colour matrix in the form of CSS `filter` and SVG's `feColorMatrix`, row by row: each row of five numbers
+    /// gives red, green, blue and alpha as the sum of the five times red, green, blue, alpha and 1, on straight
+    /// (not premultiplied) colours in 0 to 1. `None` leaves the colours as they are.
+    pub colour_matrix: Option<[f32; 20]>,
+    /// The standard deviation of a Gaussian blur applied first, in logical pixels as given to
+    /// [`Window::paint_group`](crate::Window::paint_group) and in device pixels in a [`Group`] on the scene. Zero is
+    /// no blur. The group's `bounds` must hold the blur's reach, about three times this on every side.
+    pub blur: f32,
+}
+
+impl Default for GroupEffects {
+    fn default() -> Self {
+        Self {
+            opacity: 1.0,
+            colour_matrix: None,
+            blur: 0.0,
+        }
+    }
+}
+
+/// Content that is painted apart and composited as one. The renderer paints `scene` into a surface the size of the
+/// frame, applies `effects`, and draws the result over the area of `bounds`, cut to `content_mask`.
+///
+/// A platform that cannot do this flattens the group: its content is drawn in place with the opacity given to each
+/// shape. That is [`Scene::flattened`].
+#[derive(Clone)]
+#[expect(missing_docs)]
+pub struct Group {
+    pub order: DrawOrder,
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub effects: GroupEffects,
+    pub scene: Arc<Scene>,
 }
 
 #[expect(missing_docs)]
@@ -66,6 +114,7 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        self.groups.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -138,12 +187,56 @@ impl Scene {
             .push(PaintOperation::Primitive(primitive));
     }
 
+    /// Puts a group on the scene at the current layer. The group's own scene must be finished.
+    pub fn insert_group(&mut self, mut group: Group) {
+        let clipped_bounds = group.bounds.intersect(&group.content_mask.bounds);
+        if clipped_bounds.is_empty() {
+            return;
+        }
+        group.order = self
+            .layer_stack
+            .last()
+            .copied()
+            .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds));
+        self.groups.push(group.clone());
+        self.paint_operations.push(PaintOperation::Group(group));
+    }
+
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
         for operation in &prev_scene.paint_operations[range] {
             match operation {
+                PaintOperation::Group(group) => self.insert_group(group.clone()),
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
+            }
+        }
+    }
+
+    /// The scene with every group's content drawn in place, each shape with the group's opacity by itself. For a
+    /// renderer that cannot composite a group. Two shapes of a group that overlap show through each other where a
+    /// group would show one surface, and a colour matrix is left out. `None` when the scene has no group.
+    pub fn flattened(&self) -> Option<Scene> {
+        if self.groups.is_empty() {
+            return None;
+        }
+        let mut flat = Scene::default();
+        flat.replay_flat(self, 1.0);
+        flat.finish();
+        Some(flat)
+    }
+
+    fn replay_flat(&mut self, from: &Scene, opacity: f32) {
+        for operation in &from.paint_operations {
+            match operation {
+                PaintOperation::Primitive(primitive) => {
+                    self.insert_primitive(primitive.with_opacity(opacity));
+                }
+                PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
+                PaintOperation::EndLayer => self.pop_layer(),
+                PaintOperation::Group(group) => {
+                    self.replay_flat(&group.scene, opacity * group.effects.opacity);
+                }
             }
         }
     }
@@ -160,6 +253,7 @@ impl Scene {
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.surfaces.sort_by_key(|surface| surface.order);
+        self.groups.sort_by_key(|group| group.order);
     }
 
     #[cfg_attr(
@@ -187,6 +281,8 @@ impl Scene {
             polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
+            groups_start: 0,
+            groups_iter: self.groups.iter().peekable(),
         }
     }
 }
@@ -209,10 +305,12 @@ pub(crate) enum PrimitiveKind {
     SubpixelSprite,
     PolychromeSprite,
     Surface,
+    Group,
 }
 
 pub(crate) enum PaintOperation {
     Primitive(Primitive),
+    Group(Group),
     StartLayer(Bounds<ScaledPixels>),
     EndLayer,
 }
@@ -232,6 +330,28 @@ pub enum Primitive {
 
 #[expect(missing_docs)]
 impl Primitive {
+    /// The primitive with its colours as opaque as `factor` of what they were.
+    pub fn with_opacity(&self, factor: f32) -> Primitive {
+        if factor >= 1.0 {
+            return self.clone();
+        }
+        let mut primitive = self.clone();
+        match &mut primitive {
+            Primitive::Shadow(shadow) => shadow.color = shadow.color.opacity(factor),
+            Primitive::Quad(quad) => {
+                quad.background = quad.background.opacity(factor);
+                quad.border_color = quad.border_color.opacity(factor);
+            }
+            Primitive::Path(path) => path.color = path.color.opacity(factor),
+            Primitive::Underline(underline) => underline.color = underline.color.opacity(factor),
+            Primitive::MonochromeSprite(sprite) => sprite.color = sprite.color.opacity(factor),
+            Primitive::SubpixelSprite(sprite) => sprite.color = sprite.color.opacity(factor),
+            Primitive::PolychromeSprite(sprite) => sprite.opacity *= factor,
+            Primitive::Surface(_) => {}
+        }
+        primitive
+    }
+
     pub fn bounds(&self) -> &Bounds<ScaledPixels> {
         match self {
             Primitive::Shadow(shadow) => &shadow.bounds,
@@ -283,6 +403,8 @@ struct BatchIterator<'a> {
     polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
     surfaces_start: usize,
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
+    groups_start: usize,
+    groups_iter: Peekable<slice::Iter<'a, Group>>,
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
@@ -315,6 +437,10 @@ impl<'a> Iterator for BatchIterator<'a> {
             (
                 self.surfaces_iter.peek().map(|s| s.order),
                 PrimitiveKind::Surface,
+            ),
+            (
+                self.groups_iter.peek().map(|g| g.order),
+                PrimitiveKind::Group,
             ),
         ];
         orders_and_kinds.sort_by_key(|(order, kind)| (order.unwrap_or(u32::MAX), *kind));
@@ -461,6 +587,20 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.surfaces_start = surfaces_end;
                 Some(PrimitiveBatch::Surfaces(surfaces_start..surfaces_end))
             }
+            PrimitiveKind::Group => {
+                let groups_start = self.groups_start;
+                let mut groups_end = groups_start + 1;
+                self.groups_iter.next();
+                while self
+                    .groups_iter
+                    .next_if(|group| (group.order, batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    groups_end += 1;
+                }
+                self.groups_start = groups_end;
+                Some(PrimitiveBatch::Groups(groups_start..groups_end))
+            }
         }
     }
 }
@@ -493,6 +633,8 @@ pub enum PrimitiveBatch {
         range: Range<usize>,
     },
     Surfaces(Range<usize>),
+    /// Groups of one order, in `Scene::groups`: each is painted apart and composited.
+    Groups(Range<usize>),
 }
 
 impl PrimitiveBatch {
@@ -525,6 +667,7 @@ impl PrimitiveBatch {
                 )
             }
             Self::Surfaces(range) => format!("surfaces ({})", range.len()),
+            Self::Groups(range) => format!("groups ({})", range.len()),
         }
     }
 }

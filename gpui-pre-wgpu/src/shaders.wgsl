@@ -1144,6 +1144,93 @@ fn fs_path(input: PathVarying) -> @location(0) vec4<f32> {
     return sample;
 }
 
+// --- groups --- //
+
+// A group's surface composited onto its target: premultiplied colours, an optional colour matrix on the straight
+// colours (the CSS `filter` functions are all of that form), then the opacity.
+struct GroupSprite {
+    bounds: Bounds,
+    opacity: f32,
+    has_matrix: u32,
+    blur: f32,
+    blur_axis: u32,
+    row_r: vec4<f32>,
+    row_g: vec4<f32>,
+    row_b: vec4<f32>,
+    row_a: vec4<f32>,
+    offsets: vec4<f32>,
+}
+
+struct GroupVarying {
+    @builtin(position) position: vec4<f32>,
+    @location(0) texture_coords: vec2<f32>,
+    @location(1) @interpolate(flat) group_id: u32,
+}
+
+@vertex
+fn vs_group(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> GroupVarying {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    let sprite = load_group_sprite(instance_id);
+    let device_position = to_device_position(unit_vertex, sprite.bounds);
+    let screen_position = sprite.bounds.origin + unit_vertex * sprite.bounds.size;
+
+    var out = GroupVarying();
+    out.position = device_position;
+    out.texture_coords = screen_position / globals.viewport_size;
+    out.group_id = instance_id;
+    return out;
+}
+
+@fragment
+fn fs_group(input: GroupVarying) -> @location(0) vec4<f32> {
+    let sprite = load_group_sprite(input.group_id);
+    var colour = textureSampleLevel(t_sprite, s_sprite, input.texture_coords, 0.0);
+    if (sprite.blur_axis != 0u && sprite.blur > 0.0) {
+        // One pass of a separable Gaussian: taps along x (1) or y (2), at most 32 each side. A wide blur steps over
+        // texels, which the sampler's linear filtering smooths.
+        let sigma = sprite.blur;
+        let reach = ceil(3.0 * sigma);
+        let stride = max(1.0, reach / 32.0);
+        let taps = i32(ceil(reach / stride));
+        var direction = vec2<f32>(1.0, 0.0);
+        if (sprite.blur_axis == 2u) {
+            direction = vec2<f32>(0.0, 1.0);
+        }
+        let texel = direction / globals.viewport_size;
+        var sum = vec4<f32>(0.0);
+        var weights = 0.0;
+        for (var i = -taps; i <= taps; i = i + 1) {
+            let offset = f32(i) * stride;
+            let weight = exp(-0.5 * offset * offset / (sigma * sigma));
+            sum = sum + textureSampleLevel(t_sprite, s_sprite, input.texture_coords + texel * offset, 0.0) * weight;
+            weights = weights + weight;
+        }
+        colour = sum / weights;
+    }
+    // The blur's first pass writes its result as it is: the colour matrix and the opacity belong to the last.
+    if (sprite.blur_axis == 1u) {
+        return colour;
+    }
+    if (sprite.has_matrix != 0u) {
+        var straight = vec4<f32>(0.0);
+        if (colour.a > 0.0) {
+            straight = vec4<f32>(colour.rgb / colour.a, colour.a);
+        }
+        let moved = clamp(
+            vec4<f32>(
+                dot(sprite.row_r, straight),
+                dot(sprite.row_g, straight),
+                dot(sprite.row_b, straight),
+                dot(sprite.row_a, straight),
+            ) + sprite.offsets,
+            vec4<f32>(0.0),
+            vec4<f32>(1.0),
+        );
+        colour = vec4<f32>(moved.rgb * moved.a, moved.a);
+    }
+    return colour * sprite.opacity;
+}
+
 // --- underlines --- //
 
 struct Underline {

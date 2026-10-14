@@ -445,6 +445,10 @@ impl MetalRenderer {
     }
 
     pub fn draw(&mut self, scene: &Scene) {
+        // Groups are not composited by this renderer yet: they are drawn in place, each shape with the group's
+        // opacity (`Scene::flattened`). A page's overlapping shapes under one opacity show through each other.
+        let flat = scene.flattened();
+        let scene = flat.as_ref().unwrap_or(scene);
         let layer = match &self.layer {
             Some(l) => l.clone(),
             None => {
@@ -574,6 +578,8 @@ impl MetalRenderer {
         if size.width.0 <= 0 || size.height.0 <= 0 {
             anyhow::bail!("Invalid size for render_scene_to_image: {:?}", size);
         }
+        let flat = scene.flattened();
+        let scene = flat.as_ref().unwrap_or(scene);
 
         // Headless callers do not have a Cocoa event-loop pool to release
         // autoreleased command buffers and render-pass descriptors.
@@ -739,6 +745,8 @@ impl MetalRenderer {
                     command_encoder,
                 ),
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
+                // `draw` flattens the scene, so a group never gets here.
+                PrimitiveBatch::Groups(_) => unreachable!(),
             }
         }
 

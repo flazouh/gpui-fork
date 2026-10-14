@@ -221,6 +221,26 @@ fn load_path_sprite(instance_id: u32) -> PathSprite {
     return PathSprite(read_bounds(&cursor));
 }
 
+fn load_group_sprite(instance_id: u32) -> GroupSprite {
+    var cursor = instance_cursor(instance_id * 28u);
+    let bounds = read_bounds(&cursor);
+    let opacity = read_f32(&cursor);
+    let has_matrix = read_word(&cursor);
+    let blur = read_f32(&cursor);
+    let blur_axis = read_word(&cursor);
+    let r0 = read_f32(&cursor); let r1 = read_f32(&cursor); let r2 = read_f32(&cursor); let r3 = read_f32(&cursor);
+    let g0 = read_f32(&cursor); let g1 = read_f32(&cursor); let g2 = read_f32(&cursor); let g3 = read_f32(&cursor);
+    let b0 = read_f32(&cursor); let b1 = read_f32(&cursor); let b2 = read_f32(&cursor); let b3 = read_f32(&cursor);
+    let a0 = read_f32(&cursor); let a1 = read_f32(&cursor); let a2 = read_f32(&cursor); let a3 = read_f32(&cursor);
+    let o0 = read_f32(&cursor); let o1 = read_f32(&cursor); let o2 = read_f32(&cursor); let o3 = read_f32(&cursor);
+    return GroupSprite(
+        bounds, opacity, has_matrix, blur, blur_axis,
+        vec4<f32>(r0, r1, r2, r3), vec4<f32>(g0, g1, g2, g3),
+        vec4<f32>(b0, b1, b2, b3), vec4<f32>(a0, a1, a2, a3),
+        vec4<f32>(o0, o1, o2, o3),
+    );
+}
+
 fn load_underline(instance_id: u32) -> Underline {
     var cursor = instance_cursor(instance_id * 16u);
     return Underline(

@@ -100,6 +100,49 @@ struct PathSprite {
     bounds: Bounds<ScaledPixels>,
 }
 
+/// A group composited onto its target: the area it covers, and what is done to its colours on the way. Mirrors
+/// `GroupSprite` in `shaders.wgsl`.
+#[derive(Clone, Debug)]
+#[repr(C)]
+struct GroupSprite {
+    bounds: Bounds<ScaledPixels>,
+    opacity: f32,
+    has_matrix: u32,
+    /// The blur's standard deviation in device pixels, and which pass of it this is: 0 none, 1 along x, 2 along y.
+    blur: f32,
+    blur_axis: u32,
+    /// The rows of the colour matrix that give red, green, blue and alpha: four coefficients each.
+    rows: [[f32; 4]; 4],
+    /// The fifth column of the matrix: what is added to red, green, blue and alpha.
+    offsets: [f32; 4],
+}
+
+/// The instance that composites `group`: where, with what opacity and which colour matrix.
+fn group_sprite(group: &gpui::Group) -> GroupSprite {
+    let bounds = group.bounds.intersect(&group.content_mask.bounds);
+    let identity = [
+        1.0, 0.0, 0.0, 0.0, 0.0, //
+        0.0, 1.0, 0.0, 0.0, 0.0, //
+        0.0, 0.0, 1.0, 0.0, 0.0, //
+        0.0, 0.0, 0.0, 1.0, 0.0,
+    ];
+    let m = group.effects.colour_matrix.unwrap_or(identity);
+    GroupSprite {
+        bounds,
+        opacity: group.effects.opacity.clamp(0.0, 1.0),
+        has_matrix: u32::from(group.effects.colour_matrix.is_some()),
+        blur: group.effects.blur.max(0.0),
+        blur_axis: 0,
+        rows: [
+            [m[0], m[1], m[2], m[3]],
+            [m[5], m[6], m[7], m[8]],
+            [m[10], m[11], m[12], m[13]],
+            [m[15], m[16], m[17], m[18]],
+        ],
+        offsets: [m[4], m[9], m[14], m[19]],
+    }
+}
+
 #[derive(Clone, Debug)]
 #[repr(C)]
 struct PathRasterizationVertex {
@@ -126,6 +169,7 @@ struct WgpuPipelines {
     shadows: wgpu::RenderPipeline,
     path_rasterization: wgpu::RenderPipeline,
     paths: wgpu::RenderPipeline,
+    groups: wgpu::RenderPipeline,
     underlines: wgpu::RenderPipeline,
     mono_sprites: wgpu::RenderPipeline,
     subpixel_sprites: Option<wgpu::RenderPipeline>,
@@ -192,10 +236,15 @@ struct WgpuResources {
     path_intermediate_view: Option<wgpu::TextureView>,
     path_msaa_texture: Option<wgpu::Texture>,
     path_msaa_view: Option<wgpu::TextureView>,
+    /// The surfaces groups are painted into, one for each depth of nesting, as large as the frame.
+    group_textures: Vec<(wgpu::Texture, wgpu::TextureView)>,
 }
 
 impl WgpuResources {
     fn invalidate_intermediate_textures(&mut self) {
+        for (texture, _) in self.group_textures.drain(..) {
+            texture.destroy();
+        }
         self.path_intermediate_texture = None;
         self.path_intermediate_view = None;
         self.path_msaa_texture = None;
@@ -578,6 +627,7 @@ impl WgpuRenderer {
             path_intermediate_view: None,
             path_msaa_texture: None,
             path_msaa_view: None,
+            group_textures: Vec::new(),
         };
 
         Ok(Self {
@@ -968,6 +1018,23 @@ impl WgpuRenderer {
             &shader_module,
         );
 
+        let groups = create_pipeline(
+            "groups",
+            "vs_group",
+            "fs_group",
+            &layouts.globals,
+            &layouts.instances,
+            Some(&layouts.texture),
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: Some(paths_blend),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            1,
+            &shader_module,
+        );
+
         let underlines = create_pipeline(
             "underlines",
             "vs_underline",
@@ -1059,6 +1126,7 @@ impl WgpuRenderer {
             shadows,
             path_rasterization,
             paths,
+            groups,
             underlines,
             mono_sprites,
             subpixel_sprites,
@@ -1404,8 +1472,95 @@ impl WgpuRenderer {
 
     fn record_frame(&mut self, scene: &Scene, frame_view: &wgpu::TextureView) -> Result<()> {
         let mut instance_offset = 0;
+        let mut encoder =
+            self.resources()
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("main_encoder"),
+                });
+
+        self.record_scene(
+            scene,
+            frame_view,
+            0,
+            &mut encoder,
+            &mut instance_offset,
+        )?;
+
+        self.resources()
+            .queue
+            .submit(std::iter::once(encoder.finish()));
+        Ok(())
+    }
+
+    /// The surface a group at `depth` is painted into, made when it is first needed.
+    fn group_view(&mut self, depth: usize) -> wgpu::TextureView {
+        let format = self.surface_config.format;
+        let (width, height) = (self.surface_config.width, self.surface_config.height);
+        let resources = self.resources_mut();
+        while resources.group_textures.len() <= depth {
+            let (texture, view) =
+                Self::create_path_intermediate(&resources.device, format, width, height);
+            resources.group_textures.push((texture, view));
+        }
+        resources.group_textures[depth].1.clone()
+    }
+
+    /// Draws one group instance onto `target`: the `source` surface sampled at the sprite's bounds, with the blur
+    /// pass, the colour matrix and the opacity the sprite says.
+    fn composite_group(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        load: wgpu::LoadOp<wgpu::Color>,
+        sprite: &GroupSprite,
+        source: &wgpu::TextureView,
+        instance_offset: &mut u64,
+    ) -> Result<()> {
+        let instances = self.write_instance_binding(
+            "group_sprites_bind_group",
+            instance_offset,
+            std::slice::from_ref(sprite),
+        )?;
+        let texture = self.create_texture_bind_group("group_texture_bind_group", source);
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("group_composite_pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load,
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            ..Default::default()
+        });
+        let resources = self.resources();
+        pass.set_pipeline(&resources.pipelines.groups);
+        pass.set_bind_group(0, &resources.globals_bind_group, &[]);
+        pass.set_bind_group(1, &instances.bind_group, &[]);
+        pass.set_bind_group(2, &texture, &[]);
+        pass.draw(
+            0..4,
+            instances.first_instance..instances.first_instance + 1,
+        );
+        Ok(())
+    }
+
+    /// Draws `scene` into `target`. The root scene is cleared to transparent like a group's surface, and a group
+    /// found in it is painted into its own surface (one a depth) and composited here.
+    fn record_scene(
+        &mut self,
+        scene: &Scene,
+        target: &wgpu::TextureView,
+        depth: usize,
+        encoder: &mut wgpu::CommandEncoder,
+        instance_offset: &mut u64,
+    ) -> Result<()> {
         let instance_bindings = self
-            .write_instances(scene, &mut instance_offset)
+            .write_instances(scene, instance_offset)
             .with_context(|| {
                 format!(
                     "scene too large: {} paths, {} shadows, {} quads, {} underlines, {} monochrome sprites, {} subpixel sprites, {} polychrome sprites",
@@ -1419,18 +1574,11 @@ impl WgpuRenderer {
                 )
             })?;
 
-        let mut encoder =
-            self.resources()
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("main_encoder"),
-                });
-
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: frame_view,
+                    view: target,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -1464,15 +1612,15 @@ impl WgpuRenderer {
 
                         drop(pass);
                         let rasterized = self.draw_paths_to_intermediate(
-                            &mut encoder,
+                            encoder,
                             paths,
-                            &mut instance_offset,
+                            instance_offset,
                         )?;
 
                         pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                             label: Some("main_pass_continued"),
                             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: frame_view,
+                                view: target,
                                 resolve_target: None,
                                 ops: wgpu::Operations {
                                     load: wgpu::LoadOp::Load,
@@ -1487,7 +1635,7 @@ impl WgpuRenderer {
                         if rasterized {
                             self.draw_paths_from_intermediate(
                                 paths,
-                                &mut instance_offset,
+                                instance_offset,
                                 &mut pass,
                             )?;
                         }
@@ -1526,6 +1674,75 @@ impl WgpuRenderer {
                         instance_range(range),
                         &mut pass,
                     ),
+                    PrimitiveBatch::Groups(range) => {
+                        drop(pass);
+                        for group in &scene.groups[range] {
+                            // The group is painted into a surface of its own, then composited here.
+                            let view = self.group_view(depth);
+                            self.record_scene(
+                                &group.scene,
+                                &view,
+                                depth + 1,
+                                encoder,
+                                instance_offset,
+                            )?;
+                            let sprite = group_sprite(group);
+                            if sprite.blur > 0.0 {
+                                // A blur is two passes: along x into a scratch surface, then along y onto the target
+                                // with the colour matrix and the opacity.
+                                let scratch = self.group_view(depth + 1);
+                                let first = GroupSprite {
+                                    blur_axis: 1,
+                                    opacity: 1.0,
+                                    has_matrix: 0,
+                                    ..sprite.clone()
+                                };
+                                self.composite_group(
+                                    encoder,
+                                    &scratch,
+                                    wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                    &first,
+                                    &view,
+                                    instance_offset,
+                                )?;
+                                let last = GroupSprite {
+                                    blur_axis: 2,
+                                    ..sprite
+                                };
+                                self.composite_group(
+                                    encoder,
+                                    target,
+                                    wgpu::LoadOp::Load,
+                                    &last,
+                                    &scratch,
+                                    instance_offset,
+                                )?;
+                            } else {
+                                self.composite_group(
+                                    encoder,
+                                    target,
+                                    wgpu::LoadOp::Load,
+                                    &sprite,
+                                    &view,
+                                    instance_offset,
+                                )?;
+                            }
+                        }
+                        pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("main_pass_continued"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: target,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Load,
+                                    store: wgpu::StoreOp::Store,
+                                },
+                                depth_slice: None,
+                            })],
+                            depth_stencil_attachment: None,
+                            ..Default::default()
+                        });
+                    }
                     // Surfaces are macOS-only for video playback and are not
                     // implemented by the WGPU renderer.
                     PrimitiveBatch::Surfaces(_surfaces) => {}
@@ -1533,9 +1750,6 @@ impl WgpuRenderer {
             }
         }
 
-        self.resources()
-            .queue
-            .submit(std::iter::once(encoder.finish()));
         Ok(())
     }
 
@@ -2239,6 +2453,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<Shadow>(), 28 * 4);
         assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 26 * 4);
         assert_eq!(std::mem::size_of::<PathSprite>(), 4 * 4);
+        assert_eq!(std::mem::size_of::<GroupSprite>(), 28 * 4);
         assert_eq!(std::mem::size_of::<Underline>(), 16 * 4);
         assert_eq!(std::mem::size_of::<MonochromeSprite>(), 28 * 4);
         assert_eq!(std::mem::size_of::<SubpixelSprite>(), 28 * 4);

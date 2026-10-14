@@ -4376,6 +4376,50 @@ impl Window {
         result
     }
 
+    /// Paints what `f` paints apart, and puts it on the window as one surface with `effects` applied.
+    ///
+    /// With an opacity below one this is a browser's group opacity: two shapes of `f` that overlap show as one
+    /// surface at that opacity, which giving each shape the opacity does not. `bounds` is the area the surface may
+    /// cover; what `f` paints outside it, or outside the content mask, is cut. A renderer that cannot composite a
+    /// group draws the content in place with the opacity given to each shape ([`Scene::flattened`]).
+    ///
+    /// `f` must paint primitives (quads, paths, sprites, shadows): a view cached by the window and painted inside a
+    /// group is not replayed from the previous frame.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_group<R>(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        effects: crate::GroupEffects,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint();
+
+        let content_mask = self.content_mask();
+        let covered = bounds.intersect(&content_mask.bounds);
+        if covered.is_empty() {
+            return f(self);
+        }
+        let outer = std::mem::take(&mut self.next_frame.scene);
+        let result = f(self);
+        let mut inner = std::mem::replace(&mut self.next_frame.scene, outer);
+        inner.finish();
+        // A group on the scene is in device pixels: the blur given in logical ones is scaled.
+        let effects = crate::GroupEffects {
+            blur: effects.blur * self.scale_factor(),
+            ..effects
+        };
+        let group = crate::Group {
+            order: 0,
+            bounds: self.cover_bounds(covered),
+            content_mask: self.snapped_content_mask(),
+            effects,
+            scene: std::sync::Arc::new(inner),
+        };
+        self.next_frame.scene.insert_group(group);
+        result
+    }
+
     /// Paint the drop (non-inset) shadows from `shadows` into the scene at the current
     /// z-index. Inset shadows are skipped; paint those with [`Self::paint_inset_shadows`]
     /// after the element's background so they layer on top of the fill.
