@@ -286,6 +286,40 @@ impl Scene {
             .push(PaintOperation::Primitive(primitive));
     }
 
+    /// Puts the sprites of one run of text on the scene with one order for all of them: the one a primitive that
+    /// covers the area they cover together would get. A sprite that its content mask cuts away whole is left out.
+    ///
+    /// An order that is higher than a sprite needs is not wrong, since what is painted later still lies over it.
+    /// The run costs one insertion into the bounds tree, where a sprite at a time costs one each.
+    pub fn insert_monochrome_run(&mut self, mut sprites: Vec<MonochromeSprite>) {
+        let mut area: Option<Bounds<ScaledPixels>> = None;
+        sprites.retain(|sprite| {
+            let clipped = sprite.bounds.intersect(&sprite.content_mask.bounds);
+            if clipped.is_empty() {
+                return false;
+            }
+            area = Some(match area {
+                Some(area) => area.union(&clipped),
+                None => clipped,
+            });
+            true
+        });
+        let Some(area) = area else {
+            return;
+        };
+        let order = self
+            .layer_stack
+            .last()
+            .copied()
+            .unwrap_or_else(|| self.primitive_bounds.insert(area));
+        for sprite in &mut sprites {
+            sprite.order = order;
+        }
+        self.monochrome_sprites.extend_from_slice(&sprites);
+        self.paint_operations
+            .push(PaintOperation::MonochromeRun(sprites));
+    }
+
     /// Puts a group on the scene at the current layer. The group's own scene must be finished.
     pub fn insert_group(&mut self, mut group: Group) {
         let clipped_bounds = group.bounds.intersect(&group.content_mask.bounds);
@@ -306,6 +340,7 @@ impl Scene {
             match operation {
                 PaintOperation::Group(group) => self.insert_group(group.clone()),
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
+                PaintOperation::MonochromeRun(run) => self.insert_monochrome_run(run.clone()),
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
             }
@@ -330,6 +365,15 @@ impl Scene {
             match operation {
                 PaintOperation::Primitive(primitive) => {
                     self.insert_primitive(primitive.with_opacity(opacity));
+                }
+                PaintOperation::MonochromeRun(run) => {
+                    let mut run = run.clone();
+                    if opacity < 1.0 {
+                        for sprite in &mut run {
+                            sprite.color = sprite.color.opacity(opacity);
+                        }
+                    }
+                    self.insert_monochrome_run(run);
                 }
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
@@ -409,6 +453,7 @@ pub(crate) enum PrimitiveKind {
 
 pub(crate) enum PaintOperation {
     Primitive(Primitive),
+    MonochromeRun(Vec<MonochromeSprite>),
     Group(Group),
     StartLayer(Bounds<ScaledPixels>),
     EndLayer,

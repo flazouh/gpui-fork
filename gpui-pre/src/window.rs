@@ -4872,6 +4872,96 @@ impl Window {
         Ok(())
     }
 
+    /// Paints a run of monochrome glyphs of one font, size and colour, and returns how many it could not draw.
+    ///
+    /// The result is what [`paint_glyph`](Self::paint_glyph) gives for each glyph in turn, except for the order of
+    /// the sprites on the scene: the run takes one place for all of them (the area they cover together), where a
+    /// call for each glyph takes one each. Glyphs of one colour that overlap look the same either way. A run costs
+    /// one insertion into the bounds tree of the scene and one record, where a glyph at a time costs both for each
+    /// glyph.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_glyph_run(
+        &mut self,
+        font_id: FontId,
+        font_size: Pixels,
+        color: Hsla,
+        glyphs: impl IntoIterator<Item = (GlyphId, Point<Pixels>)>,
+    ) -> usize {
+        self.invalidator.debug_assert_paint();
+
+        let mut failed = 0;
+        if self.should_use_subpixel_rendering(font_id, font_size) {
+            for (glyph_id, origin) in glyphs {
+                if self.paint_glyph(origin, font_id, glyph_id, font_size, color).is_err() {
+                    failed += 1;
+                }
+            }
+            return failed;
+        }
+
+        let scale_factor = self.scale_factor();
+        let dilation = self.text_system().glyph_dilation_for_color(color);
+        let content_mask = self.snapped_content_mask();
+        let color = color.opacity(self.element_opacity());
+        let mut sprites = Vec::new();
+        for (glyph_id, origin) in glyphs {
+            let glyph_origin = origin.scale(scale_factor);
+            let quantized_origin = Point::new(
+                round_half_toward_zero(glyph_origin.x.0 * SUBPIXEL_VARIANTS_X as f32)
+                    / SUBPIXEL_VARIANTS_X as f32,
+                round_half_toward_zero(glyph_origin.y.0 * SUBPIXEL_VARIANTS_Y as f32)
+                    / SUBPIXEL_VARIANTS_Y as f32,
+            );
+            let subpixel_variant = Point::new(
+                (quantized_origin.x.fract() * SUBPIXEL_VARIANTS_X as f32) as u8,
+                (quantized_origin.y.fract() * SUBPIXEL_VARIANTS_Y as f32) as u8,
+            );
+            let integer_origin = quantized_origin.map(|c| ScaledPixels(c.trunc()));
+            let params = RenderGlyphParams {
+                font_id,
+                glyph_id,
+                font_size,
+                subpixel_variant,
+                scale_factor,
+                is_emoji: false,
+                subpixel_rendering: false,
+                dilation,
+            };
+            let Ok(raster_bounds) = self.text_system().raster_bounds(&params) else {
+                failed += 1;
+                continue;
+            };
+            if raster_bounds.is_zero() {
+                continue;
+            }
+            let tile = self
+                .sprite_atlas
+                .get_or_insert_with(params.clone().into(), &mut || {
+                    let (size, bytes) = self.text_system().rasterize_glyph(&params)?;
+                    Ok(Some((size, Cow::Owned(bytes))))
+                });
+            let Ok(Some(tile)) = tile else {
+                failed += 1;
+                continue;
+            };
+            sprites.push(MonochromeSprite {
+                order: 0,
+                pad: 0,
+                bounds: Bounds {
+                    origin: integer_origin + raster_bounds.origin.map(Into::into),
+                    size: tile.bounds.size.map(Into::into),
+                },
+                content_mask: content_mask.clone(),
+                color,
+                tile,
+                transformation: TransformationMatrix::unit(),
+            });
+        }
+        self.next_frame.scene.insert_monochrome_run(sprites);
+        failed
+    }
+
     fn should_use_subpixel_rendering(&self, font_id: FontId, font_size: Pixels) -> bool {
         if self.platform_window.background_appearance() != WindowBackgroundAppearance::Opaque {
             return false;
