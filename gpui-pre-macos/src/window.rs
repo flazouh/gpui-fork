@@ -2347,15 +2347,15 @@ impl PlatformWindow for MacWindow {
         NSBeep()
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(all(any(test, feature = "test-support"), not(feature = "screenshot")))]
     fn render_to_image(&self, scene: &gpui::Scene) -> Result<RgbaImage> {
         let mut this = self.0.lock();
         this.renderer.render_to_image(scene)
     }
 
-    /// Draws the scene to an offscreen texture of the window's drawable size, so the layer keeps
-    /// `framebuffer_only` and the frame on screen does not change.
-    #[cfg(all(feature = "screenshot", not(any(test, feature = "test-support"))))]
+    /// Draws the scene to an offscreen texture of the window's drawable size. It waits for no
+    /// drawable of the layer, and the frame on screen does not change.
+    #[cfg(feature = "screenshot")]
     fn render_to_image(&self, scene: &gpui::Scene) -> Result<RgbaImage> {
         let mut this = self.0.lock();
         let drawable = this
