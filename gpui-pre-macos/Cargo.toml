@@ -40,6 +40,10 @@ default = ["gpui/default"]
 font-kit = ["dep:font-kit"]
 runtime_shaders = ["gpui_apple/runtime_shaders"]
 screen-capture = ["gpui/screen-capture"]
+screenshot = [
+    "gpui/screenshot",
+    "gpui_apple/screenshot",
+]
 test-support = [
     "gpui/test-support",
     "gpui_apple/test-support",

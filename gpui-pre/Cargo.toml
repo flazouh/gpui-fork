@@ -65,6 +65,7 @@ inspector = ["gpui_macros/inspector"]
 leak-detection = ["backtrace"]
 profiler = ["dep:hdrhistogram"]
 screen-capture = ["scap"]
+screenshot = []
 stacker = ["dep:stacksafe"]
 test-support = [
     "leak-detection",

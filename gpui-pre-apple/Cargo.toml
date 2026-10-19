@@ -35,6 +35,7 @@ zed-rev = "bcf6582ce3500df93a8a39366640173e6786cea6"
 bench-support = ["gpui/bench-support"]
 default = []
 runtime_shaders = []
+screenshot = ["gpui/screenshot"]
 test-support = ["gpui/test-support"]
 
 [lib]

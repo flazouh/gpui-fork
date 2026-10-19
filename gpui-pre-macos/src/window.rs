@@ -4,7 +4,7 @@ use crate::{
     kTISPropertyInputSourceIsASCIICapable, kTISPropertyInputSourceType, kTISTypeKeyboardInputMode,
     ns_string, renderer,
 };
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, feature = "test-support", feature = "screenshot"))]
 use anyhow::Result;
 use block2::RcBlock;
 use cocoa::{
@@ -32,7 +32,7 @@ use gpui::{
     WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowKind,
     WindowParams, WindowVisibility, point, px, size,
 };
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, feature = "test-support", feature = "screenshot"))]
 use image::RgbaImage;
 
 use core_foundation::base::{CFRelease, CFTypeRef};
@@ -2351,6 +2351,23 @@ impl PlatformWindow for MacWindow {
     fn render_to_image(&self, scene: &gpui::Scene) -> Result<RgbaImage> {
         let mut this = self.0.lock();
         this.renderer.render_to_image(scene)
+    }
+
+    /// Draws the scene to an offscreen texture of the window's drawable size, so the layer keeps
+    /// `framebuffer_only` and the frame on screen does not change.
+    #[cfg(all(feature = "screenshot", not(any(test, feature = "test-support"))))]
+    fn render_to_image(&self, scene: &gpui::Scene) -> Result<RgbaImage> {
+        let mut this = self.0.lock();
+        let drawable = this
+            .renderer
+            .layer()
+            .ok_or_else(|| anyhow::anyhow!("render_to_image requires a layer-backed renderer"))?
+            .drawable_size();
+        let size = size(
+            (drawable.width.ceil() as i32).into(),
+            (drawable.height.ceil() as i32).into(),
+        );
+        this.renderer.render_scene_to_image(scene, size)
     }
 
     fn a11y_init(&self, callbacks: gpui::A11yCallbacks) {
