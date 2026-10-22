@@ -60,7 +60,10 @@ impl OngoingScroll {
         self.filter_at(delta, touch_phase, Instant::now())
     }
 
-    fn filter_at(&mut self, delta: &mut Point<Pixels>, touch_phase: TouchPhase, now: Instant) {
+    /// Filters as [`Self::filter`] does, at the time `now`. Pass the executor's clock
+    /// ([`crate::BackgroundExecutor::now`]): under test it is the fake clock, so a test decides its
+    /// gestures the same way on every run, however busy the machine is.
+    pub fn filter_at(&mut self, delta: &mut Point<Pixels>, touch_phase: TouchPhase, now: Instant) {
         const UNLOCK_PERCENT: f32 = 1.9;
         const UNLOCK_LOWER_BOUND: Pixels = px(6.);
 
