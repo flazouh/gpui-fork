@@ -50,6 +50,7 @@ type StackSafe<T> = stacksafe::StackSafe<T>;
 type StackSafe<T> = T;
 
 const DRAG_THRESHOLD: f64 = 2.;
+#[cfg(test)]
 const DEFAULT_TOOLTIP_SHOW_DELAY: Duration = Duration::from_millis(500);
 const HOVERABLE_TOOLTIP_HIDE_DELAY: Duration = Duration::from_millis(500);
 
@@ -3220,6 +3221,7 @@ impl Interactivity {
                     check_is_hovered_during_prepaint,
                     long_press_tooltip_active,
                     self.tooltip_show_delay,
+                    Some(hitbox.bounds),
                     window,
                 );
             }
@@ -3711,10 +3713,10 @@ pub(crate) fn register_tooltip_mouse_handlers(
     check_is_hovered_during_prepaint: Rc<dyn Fn(&Window) -> bool>,
     long_press_tooltip_active: Rc<Cell<bool>>,
     show_delay: Option<Duration>,
+    owner_bounds: Option<Bounds<Pixels>>,
     window: &mut Window,
 ) {
     let current_view = window.current_view();
-    let show_delay = show_delay.unwrap_or(DEFAULT_TOOLTIP_SHOW_DELAY);
 
     window.on_mouse_event({
         let active_tooltip = active_tooltip.clone();
@@ -3731,6 +3733,7 @@ pub(crate) fn register_tooltip_mouse_handlers(
                 current_view,
                 phase,
                 show_delay,
+                owner_bounds,
                 window,
                 cx,
             )
@@ -3762,6 +3765,7 @@ pub(crate) fn register_tooltip_mouse_handlers(
                         &build_tooltip,
                         &check_is_hovered_during_prepaint,
                         Some(long_press_tooltip_active.clone()),
+                        owner_bounds,
                         window,
                         cx,
                     ) {
@@ -3813,7 +3817,8 @@ fn handle_tooltip_mouse_move(
     tooltip_id: Option<TooltipId>,
     current_view: EntityId,
     phase: DispatchPhase,
-    show_delay: Duration,
+    show_delay: Option<Duration>,
+    owner_bounds: Option<Bounds<Pixels>>,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -3873,6 +3878,18 @@ fn handle_tooltip_mouse_move(
             active_tooltip.borrow_mut().take();
         }
         Action::ScheduleShow => {
+            // The element's own delay, else the app's; none at all within the skip window of the last tooltip.
+            let timing = cx.tooltip_timing;
+            let now = cx.background_executor().now();
+            let skip = !timing.skip.is_zero()
+                && cx
+                    .tooltip_seen_at
+                    .is_some_and(|seen| now.saturating_duration_since(seen) <= timing.skip);
+            let show_delay = if skip {
+                Duration::ZERO
+            } else {
+                show_delay.unwrap_or(timing.show)
+            };
             let delayed_show_task = window.spawn(cx, {
                 let weak_active_tooltip = Rc::downgrade(active_tooltip);
                 let build_tooltip = build_tooltip.clone();
@@ -3888,6 +3905,7 @@ fn handle_tooltip_mouse_move(
                             &build_tooltip,
                             &check_is_hovered_during_prepaint,
                             None,
+                            owner_bounds,
                             window,
                             cx,
                         );
@@ -3910,6 +3928,7 @@ fn show_tooltip(
     build_tooltip: &Rc<dyn Fn(&mut Window, &mut App) -> Option<(AnyView, bool)>>,
     check_is_hovered_during_prepaint: &Rc<dyn Fn(&Window) -> bool>,
     long_press_tooltip_active: Option<Rc<Cell<bool>>>,
+    owner_bounds: Option<Bounds<Pixels>>,
     window: &mut Window,
     cx: &mut App,
 ) -> bool {
@@ -3920,6 +3939,7 @@ fn show_tooltip(
             tooltip: AnyTooltip {
                 view,
                 mouse_position: window.mouse_position(),
+                owner_bounds,
                 check_visible_and_update: Rc::new(move |tooltip_bounds, window, cx| {
                     if long_press_tooltip_active
                         .as_ref()

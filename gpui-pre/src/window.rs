@@ -5,7 +5,7 @@ use crate::Inspector;
 #[cfg(feature = "profiler")]
 use crate::profiler;
 use crate::{
-    Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
+    Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, TooltipAnchor, App, AppContext, Arena, Asset,
     AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
     Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
@@ -1192,6 +1192,7 @@ pub struct Window {
     next_hitbox_id: HitboxId,
     pub(crate) next_tooltip_id: TooltipId,
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
+    tooltip_anchor: Option<TooltipAnchor>,
     pub(crate) next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
     pub(crate) dirty_views: FxHashSet<EntityId>,
     focus_listeners: SubscriberSet<(), AnyWindowFocusListener>,
@@ -2049,6 +2050,7 @@ impl Window {
             next_hitbox_id: HitboxId(0),
             next_tooltip_id: TooltipId::default(),
             tooltip_bounds: None,
+            tooltip_anchor: None,
             dirty_views: FxHashSet::default(),
             focus_listeners: SubscriberSet::new(),
             focus_lost_listeners: SubscriberSet::new(),
@@ -3637,7 +3639,12 @@ impl Window {
             };
             let mut element = tooltip_request.tooltip.view.clone().into_any_element();
             let mouse_position = tooltip_request.tooltip.mouse_position;
+            self.tooltip_anchor = Some(TooltipAnchor {
+                mouse_position,
+                owner_bounds: tooltip_request.tooltip.owner_bounds,
+            });
             let tooltip_size = element.layout_as_root(AvailableSpace::min_size(), self, cx);
+            self.tooltip_anchor = None;
 
             let mut tooltip_bounds =
                 Bounds::new(mouse_position + point(px(1.), px(1.)), tooltip_size);
@@ -3682,6 +3689,7 @@ impl Window {
             self.with_absolute_element_offset(tooltip_bounds.origin, |window| {
                 element.prepaint(window, cx)
             });
+            cx.tooltip_seen_at = Some(cx.background_executor().now());
 
             self.tooltip_bounds = Some(TooltipBounds {
                 id: tooltip_request.id,
@@ -3968,6 +3976,12 @@ impl Window {
             hitbox_id: None,
             style,
         })
+    }
+
+    /// While a tooltip's view is laid out: where it was asked for, so it can place itself beside its element. None
+    /// outside a tooltip.
+    pub fn tooltip_anchor(&self) -> Option<TooltipAnchor> {
+        self.tooltip_anchor
     }
 
     /// Sets a tooltip to be rendered for the upcoming frame. This method should only be called

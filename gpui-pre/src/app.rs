@@ -830,6 +830,10 @@ pub struct App {
     flushing_effects: bool,
     pending_updates: usize,
     quit_mode: QuitMode,
+    pub(crate) tooltip_timing: TooltipTiming,
+    /// When a tooltip was last laid out on screen, by the executor's clock: within [`TooltipTiming::skip`] of it, the
+    /// next tooltip shows at once.
+    pub(crate) tooltip_seen_at: Option<std::time::Instant>,
     quitting: bool,
 
     // We need to ensure the leak detector drops last, after all tasks, callbacks and things have been dropped.
@@ -924,6 +928,8 @@ impl App {
                 #[cfg(any(feature = "inspector", debug_assertions))]
                 inspector_element_registry: InspectorElementRegistry::default(),
                 quit_mode: QuitMode::default(),
+                tooltip_timing: TooltipTiming::default(),
+                tooltip_seen_at: None,
                 quitting: false,
                 cursor_hide_mode: CursorHideMode::default(),
                 reduce_motion: false,
@@ -1750,6 +1756,23 @@ impl App {
     /// By default, [`QuitMode::Default`] is used.
     pub fn set_quit_mode(&mut self, mode: QuitMode) {
         self.quit_mode = mode;
+    }
+
+    /// Sets how long a hovered element waits before its tooltip shows, for every element that sets no delay of its
+    /// own, and the skip window: a tooltip that was on screen less than `skip` ago makes the next one show at once.
+    pub fn set_tooltip_timing(&mut self, timing: TooltipTiming) {
+        self.tooltip_timing = timing;
+    }
+
+    /// The tooltip timing in force.
+    pub fn tooltip_timing(&self) -> TooltipTiming {
+        self.tooltip_timing
+    }
+
+    /// When a tooltip was last on screen, by the executor clock: a tooltip built within the skip window of it follows
+    /// another.
+    pub fn tooltip_seen_at(&self) -> Option<std::time::Instant> {
+        self.tooltip_seen_at
     }
 
     /// Returns the SVG renderer used by the application.
@@ -3190,10 +3213,38 @@ pub struct AnyTooltip {
     /// The absolute position of the mouse when the tooltip was deployed.
     pub mouse_position: Point<Pixels>,
 
+    /// The bounds of the element the tooltip belongs to, when it has them: the view reads them through
+    /// [`Window::tooltip_anchor`] to stand beside the element rather than at the pointer.
+    pub owner_bounds: Option<Bounds<Pixels>>,
+
     /// Given the bounds of the tooltip, checks whether the tooltip should still be visible and
     /// updates its state accordingly. This is needed atop the hovered element's mouse move handler
     /// to handle the case where the element is not painted (e.g. via use of `visible_on_hover`).
     pub check_visible_and_update: Rc<dyn Fn(Bounds<Pixels>, &mut Window, &mut App) -> bool>,
+}
+
+/// How tooltips wait: [`App::set_tooltip_timing`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TooltipTiming {
+    /// How long a hovered element waits before its tooltip shows.
+    pub show: std::time::Duration,
+    /// After a tooltip was on screen, how long the next one shows at once. Zero turns the skip off.
+    pub skip: std::time::Duration,
+}
+
+impl Default for TooltipTiming {
+    fn default() -> Self {
+        Self { show: std::time::Duration::from_millis(500), skip: std::time::Duration::ZERO }
+    }
+}
+
+/// Where a tooltip being laid out was asked for: [`Window::tooltip_anchor`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TooltipAnchor {
+    /// The pointer when the tooltip was deployed; the tooltip's view is laid out from just past it.
+    pub mouse_position: Point<Pixels>,
+    /// The bounds of the element it belongs to, when it has them.
+    pub owner_bounds: Option<Bounds<Pixels>>,
 }
 
 /// A keystroke event, and potentially the associated action
