@@ -3640,7 +3640,7 @@ impl Window {
             let mut element = tooltip_request.tooltip.view.clone().into_any_element();
             let mouse_position = tooltip_request.tooltip.mouse_position;
             self.tooltip_anchor = Some(TooltipAnchor {
-                mouse_position,
+                origin: mouse_position + point(px(1.), px(1.)),
                 owner_bounds: tooltip_request.tooltip.owner_bounds,
             });
             let tooltip_size = element.layout_as_root(AvailableSpace::min_size(), self, cx);

@@ -3241,8 +3241,9 @@ impl Default for TooltipTiming {
 /// Where a tooltip being laid out was asked for: [`Window::tooltip_anchor`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TooltipAnchor {
-    /// The pointer when the tooltip was deployed; the tooltip's view is laid out from just past it.
-    pub mouse_position: Point<Pixels>,
+    /// Where the tooltip's view is laid out from, unless the window's edge moves it: just past the pointer when it was
+    /// deployed.
+    pub origin: Point<Pixels>,
     /// The bounds of the element it belongs to, when it has them.
     pub owner_bounds: Option<Bounds<Pixels>>,
 }
