@@ -66,6 +66,7 @@ use uuid::Uuid;
 pub(crate) mod a11y;
 mod prompts;
 mod view_reuse;
+pub(crate) use view_reuse::{FrameIndex, impl_frame_index};
 
 pub use a11y::A11ySubtreeBuilder;
 

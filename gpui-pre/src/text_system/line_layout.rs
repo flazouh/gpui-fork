@@ -492,38 +492,17 @@ pub(crate) struct LineLayoutIndex {
     wrapped_lines_by_hash_index: usize,
 }
 
-impl LineLayoutIndex {
-    /// This index, counted from `base`, counted from where `base` counts from. The font generation stays the one
-    /// the index was taken in.
-    pub(crate) fn offset_by(&self, base: &Self) -> Self {
-        Self {
-            font_generation: self.font_generation,
-            lines_index: base.lines_index + self.lines_index,
-            wrapped_lines_index: base.wrapped_lines_index + self.wrapped_lines_index,
-            lines_by_hash_index: base.lines_by_hash_index + self.lines_by_hash_index,
-            wrapped_lines_by_hash_index: base.wrapped_lines_by_hash_index
-                + self.wrapped_lines_by_hash_index,
-        }
-    }
-
-    /// This index counted from `base`. A frame that clears the cache for a new font generation can leave it before
-    /// `base`: the counts then come out as zero, and [`LineLayoutCache::holds_layouts`] refuses a range they spoil.
-    pub(crate) fn relative_to(&self, base: &Self) -> Self {
-        Self {
-            font_generation: self.font_generation,
-            lines_index: self.lines_index.saturating_sub(base.lines_index),
-            wrapped_lines_index: self
-                .wrapped_lines_index
-                .saturating_sub(base.wrapped_lines_index),
-            lines_by_hash_index: self
-                .lines_by_hash_index
-                .saturating_sub(base.lines_by_hash_index),
-            wrapped_lines_by_hash_index: self
-                .wrapped_lines_by_hash_index
-                .saturating_sub(base.wrapped_lines_by_hash_index),
-        }
-    }
-}
+// A frame that clears the cache for a new font generation leaves an index before one taken earlier in it.
+crate::window::impl_frame_index!(LineLayoutIndex {
+    counts: [
+        lines_index,
+        wrapped_lines_index,
+        lines_by_hash_index,
+        wrapped_lines_by_hash_index,
+    ],
+    indices: [],
+    kept: [font_generation],
+});
 
 impl LineLayoutCache {
     pub fn new(

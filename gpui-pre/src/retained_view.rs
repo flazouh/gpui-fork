@@ -1,22 +1,10 @@
-//! Drawing of cached views ([`crate::Entity::cached`], [`crate::AnyView::cached`]).
-//!
-//! A cached view paints into a scene of its own, which goes on the scene of whatever draws the view as one
-//! [`RetainedChunk`]. Each frame the view is drawn in one of three ways:
-//!
-//! - Reused: neither the view nor a view inside it was notified. Its prepaint and paint output is carried over from
-//!   the frame before, and its chunk goes on the scene again.
-//! - Replayed: only cached views inside it were notified. The view does not render. Its own output is carried over
-//!   in runs between the cached views it drew (its slots), and each of those is drawn in place. See [`replay`].
-//! - Rendered: anything else. Every view inside it renders too, as under [`Window::refresh`], because a view that
-//!   renders may change a view inside it without notifying it.
-
 mod replay;
 #[cfg(test)]
 mod tests;
 
 use self::replay::{
-    CarriedFrom, Replay, ReplayPlan, Slots, record_paint, record_prepaint, relative_paint,
-    relative_prepaint, replay_paint, replay_prepaint,
+    CarriedFrom, Replay, ReplayPlan, Slots, record_paint, record_prepaint, relative, replay_paint,
+    replay_prepaint,
 };
 pub(crate) use self::replay::{PaintFrame, PrepaintFrame};
 use crate::{
@@ -33,7 +21,6 @@ use std::{
     },
 };
 
-/// What prepainting a view left for its paint.
 #[doc(hidden)]
 pub struct ViewPrepaint(Outcome);
 
@@ -57,30 +44,30 @@ impl ViewPrepaint {
 }
 
 struct ViewElementState {
-    /// Where the view's prepaint output sits, counted from the start of the output of the cached view that draws
-    /// it (from the start of the frame for a view in none). Counted so, it stays right while that view is carried
-    /// over to another place in the frame.
-    prepaint_range: Range<PrepaintStateIndex>,
-    /// Like `prepaint_range`, for paint. The scene index counts in the scene of the cached view that draws it.
-    paint_range: Range<PaintIndex>,
-    /// The frame `prepaint_range` is of. The view is not prepainted in a frame that carries it over inside a
-    /// cached view, or inside a deferred draw: the range can then be older than the frame before. It is of the
-    /// frame being drawn in a second prepaint, after [`Window::transact`] threw the first away.
-    prepainted_in: u64,
-    /// The frame `paint_range` and the retained scene are of. A view is prepainted without being painted while it
-    /// is hidden: nothing is then carried over, because the scene may be older than what the view rendered last.
-    painted_in: u64,
-    /// The frame the view last rendered or replayed in, which is the frame it last drew its slots in.
-    drew_slots_in: u64,
     cache_key: ViewElementCacheKey,
+    prepainted: Option<FrameOutput<PrepaintStateIndex>>,
+    painted: Option<FrameOutput<PaintIndex>>,
+    /// The frame the view last rendered or replayed in.
+    drew_slots_in: u64,
     accessed_entities: FxHashSet<EntityId>,
     /// What the view read while it rendered and painted, outside the cached views inside it. A replay shows none
     /// of a change to these, so a notified one has the view render.
     own_reads: FxHashSet<EntityId>,
-    /// Renders the view again, for a cached view that draws it and replays around it.
     render_handle: Option<AnyWeakView>,
     retained: RetainedPaint,
     slots: Slots,
+}
+
+/// Where a view's output sits in the frame `frame`, counted from the start of the output of the cached view that
+/// draws it, or of the frame for a view in none.
+///
+/// The frame can be older than the one before: a view is not prepainted in a frame that carries it over inside a
+/// cached view or a deferred draw, and not painted while it is hidden. A view is carried over only when both its
+/// outputs are of the frame it is carried over from. The retained scene is of the frame of the paint output, so a
+/// view that rendered while it was hidden never shows the scene of an older render.
+struct FrameOutput<I> {
+    range: Range<I>,
+    frame: u64,
 }
 
 #[derive(PartialEq)]
@@ -89,9 +76,12 @@ struct ViewElementCacheKey {
     content_mask: ContentMask<Pixels>,
     text_style: TextStyle,
     rem_size: Pixels,
-    /// The bits of the opacity the elements around the view give it: a NaN then matches itself.
-    opacity: u32,
+    opacity: OpacityBits,
 }
+
+/// An opacity that equals itself when it is NaN, so that a cache key which holds one can match.
+#[derive(PartialEq)]
+struct OpacityBits(u32);
 
 impl ViewElementCacheKey {
     fn current(bounds: Bounds<Pixels>, window: &Window) -> Self {
@@ -100,12 +90,11 @@ impl ViewElementCacheKey {
             content_mask: window.content_mask(),
             text_style: window.text_style(),
             rem_size: window.rem_size(),
-            opacity: window.element_opacity.to_bits(),
+            opacity: OpacityBits(window.element_opacity.to_bits()),
         }
     }
 }
 
-/// What a cached view last painted, put on the scene again in each frame the view is clean.
 struct RetainedPaint {
     /// One id for the view's whole life at its place in the element tree.
     layer_id: u64,
@@ -163,10 +152,12 @@ impl RetainedPaint {
 }
 
 enum Plan {
+    /// Neither the view nor a view inside it was notified.
     Reuse {
         prepaint: Range<PrepaintStateIndex>,
         paint: Range<PaintIndex>,
     },
+    /// Only cached views inside the view were notified.
     Replay(ReplayPlan),
     Render,
 }
@@ -174,18 +165,39 @@ enum Plan {
 impl ViewElementState {
     fn new(cache_key: ViewElementCacheKey) -> Self {
         Self {
-            prepaint_range: PrepaintStateIndex::default()..PrepaintStateIndex::default(),
-            paint_range: PaintIndex::default()..PaintIndex::default(),
-            prepainted_in: 0,
-            painted_in: 0,
-            drew_slots_in: 0,
             cache_key,
+            prepainted: None,
+            painted: None,
+            drew_slots_in: 0,
             accessed_entities: FxHashSet::default(),
             own_reads: FxHashSet::default(),
             render_handle: None,
             retained: RetainedPaint::new(),
-            slots: Slots::Prepainted(None),
+            slots: Slots::Unknown,
         }
+    }
+
+    /// Where the frame before holds the view's output, if the view can be carried over from it.
+    fn output_to_carry_over(
+        &self,
+        cache_key: &ViewElementCacheKey,
+        window: &Window,
+    ) -> Option<(Range<PrepaintStateIndex>, Range<PaintIndex>)> {
+        if self.cache_key != *cache_key || window.refreshing {
+            return None;
+        }
+        let carried_from = CarriedFrom::current(window)?;
+        let of_that_frame = |frame: u64| frame == carried_from.drawn_in;
+        let prepainted = self.prepainted.as_ref()?;
+        let painted = self.painted.as_ref()?;
+        if !of_that_frame(prepainted.frame) || !of_that_frame(painted.frame) {
+            return None;
+        }
+        let prepaint = carried_from.prepaint_range(&prepainted.range);
+        let paint = carried_from.paint_range(&painted.range);
+        (window.rendered_frame_holds_prepaint(&prepaint)
+            && window.rendered_frame_holds_paint(&paint))
+        .then_some((prepaint, paint))
     }
 
     fn plan(
@@ -194,43 +206,73 @@ impl ViewElementState {
         cache_key: &ViewElementCacheKey,
         window: &Window,
     ) -> Plan {
-        if self.cache_key != *cache_key || window.refreshing {
-            return Plan::Render;
-        }
-        let Some(carried_from) = CarriedFrom::current(window) else {
+        let Some((prepaint, paint)) = self.output_to_carry_over(cache_key, window) else {
             return Plan::Render;
         };
-        if self.prepainted_in != carried_from.drawn_in || self.painted_in != carried_from.drawn_in {
-            return Plan::Render;
-        }
-        let prepaint = carried_from.prepaint_range(&self.prepaint_range);
-        let paint = carried_from.paint_range(&self.paint_range);
-        if !window.rendered_frame_holds_prepaint(&prepaint)
-            || !window.rendered_frame_holds_paint(&paint)
-        {
-            return Plan::Render;
-        }
         if !window.dirty_views.contains(&entity_id) {
             return Plan::Reuse { prepaint, paint };
         }
-        match self.replay_plan(entity_id, prepaint, paint, window) {
-            Some(plan) => Plan::Replay(plan),
-            None => Plan::Render,
+        self.replay_plan(entity_id, prepaint, paint, window)
+            .map_or(Plan::Render, Plan::Replay)
+    }
+
+    /// Prepaints the view from the frame before. `None` when the view has to render.
+    fn carry_over(
+        &mut self,
+        entity_id: EntityId,
+        cache_key: &ViewElementCacheKey,
+        prepaint_start: &PrepaintStateIndex,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Outcome> {
+        match self.plan(entity_id, cache_key, window) {
+            Plan::Render => None,
+            Plan::Reuse { prepaint, paint } => {
+                window.reuse_prepaint(prepaint);
+                cx.entities.extend_accessed(&self.accessed_entities);
+                Some(Outcome::Reused { paint })
+            }
+            Plan::Replay(plan) => {
+                let (replayed, accessed_entities) = cx.detect_accessed_entities(|cx| {
+                    // A replay that stops half way has put part of the view on the frame: this takes it off.
+                    window.transact(|window| {
+                        replay_prepaint(plan, prepaint_start.clone(), window, cx).ok_or(())
+                    })
+                });
+                let (replay, slots) = replayed.ok()?;
+                self.accessed_entities.extend(accessed_entities);
+                cx.entities.extend_accessed(&self.accessed_entities);
+                self.slots = slots;
+                self.drew_slots_in = window.frame_number;
+                Some(Outcome::Replayed(replay))
+            }
         }
     }
 
-    /// Ends a paint into the view's own scene: keeps that scene, puts back the one the view is drawn on, and pairs
-    /// the slots with what the cached views painted in.
-    fn finish_paint(&mut self, outer_scene: Scene, window: &mut Window) {
+    /// Runs `paint` with a scene of the view's own in place of the one the view is drawn on, and keeps what it
+    /// painted.
+    fn paint_into_own_scene<R>(
+        &mut self,
+        paint_start: PaintIndex,
+        window: &mut Window,
+        cx: &mut App,
+        paint: impl FnOnce(&mut Window, &mut App) -> R,
+    ) -> R {
+        let frame = PaintFrame::new(paint_start, window, cx);
+        let outer_scene = mem::replace(&mut window.next_frame.scene, self.retained.empty_scene());
+        let (result, paints) = frame.enter(window, |window| paint(window, cx));
         let scene = mem::replace(&mut window.next_frame.scene, outer_scene);
         self.retained.repainted(scene);
-        let paints = window
-            .cached_view_paints
-            .pop()
-            .and_then(PaintFrame::into_paints);
-        let slots = mem::replace(&mut self.slots, Slots::Painted(None));
-        self.slots = slots.painted(paints);
+        self.slots = mem::replace(&mut self.slots, Slots::Unknown).painted(paints);
+        result
     }
+}
+
+fn with_refreshing<R>(window: &mut Window, f: impl FnOnce(&mut Window) -> R) -> R {
+    let refreshing = mem::replace(&mut window.refreshing, true);
+    let result = f(window);
+    window.refreshing = refreshing;
+    result
 }
 
 pub(crate) fn prepaint(
@@ -245,32 +287,9 @@ pub(crate) fn prepaint(
     window.with_element_state::<ViewElementState, _>(global_id, |mut state, window| {
         let cache_key = ViewElementCacheKey::current(bounds, window);
         let prepaint_start = window.prepaint_index();
-        let plan = state.as_mut().map_or(Plan::Render, |state| {
-            state.plan(entity_id, &cache_key, window)
-        });
-        let carried_over = match (plan, state.as_mut()) {
-            (Plan::Reuse { prepaint, paint }, Some(state)) => {
-                window.reuse_prepaint(prepaint);
-                cx.entities.extend_accessed(&state.accessed_entities);
-                Some(Outcome::Reused { paint })
-            }
-            (Plan::Replay(plan), Some(state)) => {
-                let (replayed, accessed_entities) = cx.detect_accessed_entities(|cx| {
-                    // A replay that stops half way has put part of the view on the frame: this takes it off.
-                    window.transact(|window| {
-                        replay_prepaint(plan, prepaint_start.clone(), window, cx).ok_or(())
-                    })
-                });
-                replayed.ok().map(|(replay, slots)| {
-                    state.accessed_entities.extend(accessed_entities);
-                    cx.entities.extend_accessed(&state.accessed_entities);
-                    state.slots = slots;
-                    state.drew_slots_in = window.frame_number;
-                    Outcome::Replayed(replay)
-                })
-            }
-            _ => None,
-        };
+        let carried_over = state
+            .as_mut()
+            .and_then(|state| state.carry_over(entity_id, &cache_key, &prepaint_start, window, cx));
         let (outcome, mut state) = match (carried_over, state) {
             (Some(outcome), Some(state)) => (outcome, state),
             (_, previous) => render_view(
@@ -285,7 +304,6 @@ pub(crate) fn prepaint(
         };
 
         let prepaint_end = window.prepaint_index();
-        state.prepainted_in = window.frame_number;
         let base = record_prepaint(
             entity_id,
             global_id,
@@ -294,7 +312,10 @@ pub(crate) fn prepaint(
             slot_start..prepaint_end.clone(),
             window,
         );
-        state.prepaint_range = relative_prepaint(prepaint_start..prepaint_end, &base);
+        state.prepainted = relative(prepaint_start..prepaint_end, &base).map(|range| FrameOutput {
+            range,
+            frame: window.frame_number,
+        });
         (ViewPrepaint(outcome), state)
     })
 }
@@ -309,22 +330,24 @@ fn render_view(
     render: &mut dyn FnMut(&mut Window, &mut App) -> (AnyElement, Option<AnyWeakView>),
 ) -> (Outcome, ViewElementState) {
     let frame = PrepaintFrame::rendering(prepaint_start, window);
-    window.cached_view_prepaints.push(frame);
-    let refreshing = mem::replace(&mut window.refreshing, true);
-    let (((element, render_handle), own_reads), accessed_entities) =
-        cx.detect_accessed_entities(|cx| {
-            cx.with_read_scope(|cx| {
-                let (mut element, render_handle) = render(window, cx);
-                element.layout_as_root(Size::<AvailableSpace>::from(bounds.size), window, cx);
-                element.prepaint_at(bounds.origin, window, cx);
-                (element, render_handle)
+    let ((((element, render_handle), own_reads), accessed_entities), slots) =
+        frame.enter(window, |window| {
+            // Every view inside renders too: a view that renders may change one inside it without a notify.
+            with_refreshing(window, |window| {
+                cx.detect_accessed_entities(|cx| {
+                    cx.with_read_scope(|cx| {
+                        let (mut element, render_handle) = render(window, cx);
+                        element.layout_as_root(
+                            Size::<AvailableSpace>::from(bounds.size),
+                            window,
+                            cx,
+                        );
+                        element.prepaint_at(bounds.origin, window, cx);
+                        (element, render_handle)
+                    })
+                })
             })
         });
-    window.refreshing = refreshing;
-    let slots = window
-        .cached_view_prepaints
-        .pop()
-        .map_or(Slots::Prepainted(None), PrepaintFrame::into_slots);
 
     let mut state = match previous {
         Some(mut state) => {
@@ -351,39 +374,28 @@ pub(crate) fn paint(
     let slot_start = window.paint_index();
     window.with_element_state::<ViewElementState, _>(global_id, |state, window| {
         let Some(mut state) = state else {
-            // Only a prepaint of this frame leaves a state, so nothing here is retained: the view paints as an
-            // uncached one does.
-            if let Outcome::Rendered(element) = &mut prepaint.0 {
-                element.paint(window, cx);
-            }
-            let cache_key = ViewElementCacheKey::current(Bounds::default(), window);
-            return ((), ViewElementState::new(cache_key));
+            return ((), paint_uncached(prepaint, window, cx));
         };
 
         let paint_start = window.paint_index();
         match &mut prepaint.0 {
             Outcome::Rendered(element) => {
-                let frame = PaintFrame::new(paint_start.clone(), window, cx);
-                window.cached_view_paints.push(frame);
-                let outer_scene =
-                    mem::replace(&mut window.next_frame.scene, state.retained.empty_scene());
-                let refreshing = mem::replace(&mut window.refreshing, true);
-                let ((), own_reads) = cx.with_read_scope(|cx| element.paint(window, cx));
-                window.refreshing = refreshing;
+                let own_reads =
+                    state.paint_into_own_scene(paint_start.clone(), window, cx, |window, cx| {
+                        with_refreshing(window, |window| {
+                            cx.with_read_scope(|cx| element.paint(window, cx)).1
+                        })
+                    });
                 state.own_reads.extend(own_reads);
-                state.finish_paint(outer_scene, window);
             }
             Outcome::Reused { paint } => {
                 window.reuse_paint_except_scene(paint.clone());
                 state.retained.kept_clean();
             }
             Outcome::Replayed(replay) => {
-                let frame = PaintFrame::new(paint_start.clone(), window, cx);
-                window.cached_view_paints.push(frame);
-                let outer_scene =
-                    mem::replace(&mut window.next_frame.scene, state.retained.empty_scene());
-                replay_paint(replay, window, cx);
-                state.finish_paint(outer_scene, window);
+                state.paint_into_own_scene(paint_start.clone(), window, cx, |window, cx| {
+                    replay_paint(replay, window, cx)
+                });
             }
         }
         if let Some(chunk) = state.retained.chunk() {
@@ -391,9 +403,24 @@ pub(crate) fn paint(
         }
 
         let paint_end = window.paint_index();
-        state.painted_in = window.frame_number;
         let base = record_paint(entity_id, slot_start..paint_end.clone(), window, cx);
-        state.paint_range = relative_paint(paint_start..paint_end, &base);
+        state.painted = relative(paint_start..paint_end, &base).map(|range| FrameOutput {
+            range,
+            frame: window.frame_number,
+        });
         ((), state)
     })
+}
+
+/// Paints a view that has no state. Only a prepaint of this frame leaves a state, so nothing here is retained: the
+/// view paints as an uncached one does.
+fn paint_uncached(
+    prepaint: &mut ViewPrepaint,
+    window: &mut Window,
+    cx: &mut App,
+) -> ViewElementState {
+    if let Outcome::Rendered(element) = &mut prepaint.0 {
+        element.paint(window, cx);
+    }
+    ViewElementState::new(ViewElementCacheKey::current(Bounds::default(), window))
 }
