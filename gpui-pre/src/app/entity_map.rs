@@ -56,7 +56,6 @@ impl Display for EntityId {
 pub(crate) struct EntityMap {
     entities: SecondaryMap<EntityId, Box<dyn Any>>,
     pub accessed_entities: RefCell<FxHashSet<EntityId>>,
-    /// The entities read or updated in the innermost open [`App::with_read_scope`].
     read_scope: RefCell<Option<FxHashSet<EntityId>>>,
     ref_counts: Arc<RwLock<EntityRefCounts>>,
 }
@@ -190,7 +189,6 @@ impl EntityMap {
         self.accessed_entities.get_mut().clear();
     }
 
-    /// Opens a read scope in place of `outer` and returns what the scope it closes read.
     pub fn swap_read_scope(
         &mut self,
         outer: Option<FxHashSet<EntityId>>,

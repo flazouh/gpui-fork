@@ -283,9 +283,8 @@ impl DispatchTree {
         }
     }
 
-    /// Moves the nodes of `old_range` from `source`. The ones still open at the end stay pushed, and on
-    /// `open_nodes` by their ids in `source`, so that another run goes on from where this one stopped. Returns
-    /// whether a moved node has the focus.
+    /// The nodes still open at the end stay pushed, and on `open_nodes` by their ids in `source`, so that another
+    /// run goes on from where this one stopped. Returns whether a moved node has the focus.
     pub fn reuse_nodes_open(
         &mut self,
         old_range: Range<usize>,

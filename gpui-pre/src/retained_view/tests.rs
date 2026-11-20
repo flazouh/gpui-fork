@@ -38,7 +38,6 @@ impl Render for Row {
     }
 }
 
-/// A view the pane draws uncached, in its header.
 struct Status {
     count: u64,
     renders: usize,
@@ -76,11 +75,8 @@ struct Pane {
     badge: Option<Badge>,
     renders: usize,
     log: Log,
-    /// The header shows the first row's label, which the pane reads when it renders.
     header_reads_first_row: bool,
-    /// The rows sit in a hover group of the pane.
     rows_in_hover_group: bool,
-    /// Rendering changes every row without notifying it.
     changes_rows_when_it_renders: bool,
 }
 
@@ -629,7 +625,6 @@ fn focus_stays_on_a_clean_row_while_another_row_changes(cx: &mut TestAppContext)
     assert!(focused, "the frame has row 6 as the focused element");
 }
 
-/// The alpha of every quad a cached view painted in the last frame.
 fn retained_quad_alphas(cx: &mut VisualTestContext) -> Vec<f32> {
     fn collect(scene: &Scene, retained: bool, alphas: &mut Vec<f32>) {
         if retained {

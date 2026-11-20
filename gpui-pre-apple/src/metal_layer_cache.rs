@@ -66,7 +66,6 @@ pub(super) struct MetalLayerCache {
     composite_pipeline_state: metal::RenderPipelineState,
     layers: HashMap<u64, Layer>,
     bytes: usize,
-    /// The chunks of the frame before and of this one, by layer id.
     seen: HashMap<u64, SeenChunk>,
     frame: u64,
 }
@@ -83,7 +82,6 @@ struct Layer {
 struct SeenChunk {
     generation: u64,
     frame: u64,
-    /// Frames in a row, before `frame`, that the chunk went on the frame with this generation.
     clean_frames: u32,
 }
 
@@ -131,7 +129,6 @@ fn texture_bytes(size: Size<DevicePixels>) -> usize {
     size.width.0.max(0) as usize * size.height.0.max(0) as usize * BYTES_PER_PIXEL
 }
 
-/// The chunk's bounds out to whole device pixels, cut to the viewport.
 fn layer_rect(
     chunk: &RetainedChunk,
     viewport_size: Size<DevicePixels>,
@@ -186,7 +183,6 @@ impl MetalLayerCache {
         self.bytes = self.layers.values().map(Layer::bytes).sum();
     }
 
-    /// Drops the layers the frame drew into, when its command buffer is not committed.
     pub(super) fn forget_frame(&mut self) {
         let frame = self.frame;
         self.layers.retain(|_, layer| layer.drawn_in_frame != frame);
@@ -219,14 +215,12 @@ impl MetalLayerCache {
         seen.clean_frames
     }
 
-    /// The layer `chunk` composites from in this frame.
     fn layer(&self, chunk: &RetainedChunk) -> Option<&Layer> {
         self.layers.get(&chunk.layer_id).filter(|layer| {
             layer.generation == chunk.generation && layer.last_used_frame == self.frame
         })
     }
 
-    /// Takes the chunk's layer for this frame if it is up to date and covers `rect`.
     fn keep(&mut self, chunk: &RetainedChunk, rect: Bounds<DevicePixels>) -> bool {
         match self.layers.get_mut(&chunk.layer_id) {
             Some(layer) if layer.generation == chunk.generation && layer.rect == rect => {
@@ -237,8 +231,7 @@ impl MetalLayerCache {
         }
     }
 
-    /// A texture of `rect`'s size to draw `chunk` into: the one of its stale layer when the size is the same, else
-    /// a new one, for which layers no frame uses any more make room. `None` when the layers in use leave no room.
+    /// `None` when the layers this frame uses leave no room for a texture of `rect`'s size.
     fn take_texture(
         &mut self,
         device: &metal::DeviceRef,
@@ -293,8 +286,7 @@ impl MetalLayerCache {
 }
 
 impl MetalRenderer {
-    /// Gives each chunk of the scene that is worth a layer one that is up to date, drawing into it when it is
-    /// missing or stale. A chunk that stays drawn in place is searched for chunks of its own.
+    /// A chunk that stays drawn in place is searched for chunks of its own.
     pub(super) fn refresh_layers(
         &mut self,
         scene: &Scene,
@@ -322,8 +314,7 @@ impl MetalRenderer {
         Ok(())
     }
 
-    /// Draws `chunk` into a layer the size of `rect`, with every primitive moved back by `rect`'s origin. `false`
-    /// when the cache has no room for the layer.
+    /// `false` when the cache has no room for the layer.
     fn draw_layer(
         &mut self,
         chunk: &RetainedChunk,
@@ -415,8 +406,8 @@ pub(super) struct LayerBinding {
     size: Size<DevicePixels>,
 }
 
-/// Writes the instances of the scene and of its chunks. A chunk with a layer in `layers` for this frame gets the
-/// sprite of that layer instead. With an `origin`, every primitive is moved back by it, to draw into a layer.
+/// A chunk with a layer in `layers` for this frame gets the sprite of that layer in place of its instances. With an
+/// `origin`, every primitive is moved back by it, to draw into a layer.
 pub(super) fn write_scene_instances(
     scene: &Scene,
     writer: &mut InstanceBufferWriter,
@@ -596,7 +587,6 @@ mod tests {
         }
     }
 
-    /// A frame with a background, the chunk over it, and a translucent quad painted over part of the chunk.
     fn frame(chunk: Option<RetainedChunk>) -> Scene {
         let everything = bounds(0., 0., 400., 300.);
         let mut scene = Scene::default();
@@ -805,20 +795,25 @@ mod tests {
         assert_eq!(MAX_CACHED_LAYER_BYTES, 4 * layer_bytes);
         let mut renderer = renderer();
 
-        // Five clean chunks in one frame: four get a layer, the fifth is drawn in place.
         let five = frame_of((1..=5).map(|layer_id| chunk(&content, layer_id, 1)));
         for _ in 0..2 {
             renderer.render_scene(&five, viewport).unwrap();
         }
-        assert_eq!(renderer.layer_cache.layers.len(), 4);
+        assert_eq!(
+            renderer.layer_cache.layers.len(),
+            4,
+            "of five clean chunks, four get a layer and the fifth is drawn in place"
+        );
         assert_eq!(renderer.layer_cache.bytes, MAX_CACHED_LAYER_BYTES);
 
-        // A sixth chunk alone on the frame takes the place of a layer that frame does not use.
         let sixth = frame_of([chunk(&content, 6, 1)]);
         for _ in 0..2 {
             renderer.render_scene(&sixth, viewport).unwrap();
         }
-        assert!(renderer.layer_cache.layers.contains_key(&6));
+        assert!(
+            renderer.layer_cache.layers.contains_key(&6),
+            "a sixth chunk takes the place of a layer its frame does not use"
+        );
         assert_eq!(renderer.layer_cache.layers.len(), 4);
         assert_eq!(renderer.layer_cache.bytes, MAX_CACHED_LAYER_BYTES);
 

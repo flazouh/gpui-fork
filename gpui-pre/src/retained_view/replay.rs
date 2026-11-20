@@ -133,7 +133,6 @@ impl PrepaintFrame {
         }
     }
 
-    /// Runs `prepaint` with this view as the innermost one, and returns the slots it recorded.
     pub(super) fn enter<R>(
         self,
         window: &mut Window,
@@ -200,7 +199,6 @@ pub(crate) struct PaintFrame {
     image_caches: usize,
     group_depth: usize,
     hover_groups: usize,
-    /// `None` once a view was drawn that a replay could not draw again in place.
     paints: Option<Vec<SlotPaint>>,
 }
 
@@ -215,7 +213,6 @@ impl PaintFrame {
         }
     }
 
-    /// Runs `paint` with this view as the innermost one, and returns what its slots painted.
     pub(super) fn enter<R>(
         self,
         window: &mut Window,
@@ -319,7 +316,6 @@ pub(super) struct ReplayPlan {
     children: Vec<(Slot, AnyView)>,
 }
 
-/// A replay whose prepaint is done, for paint to finish.
 pub(super) struct Replay {
     paint: Range<PaintIndex>,
     /// The view's scene of the frame before. Its operations between the slots go on the new one.
@@ -432,9 +428,8 @@ fn slots_are_in_order(
         && scene_run_start <= scene.len()
 }
 
-/// Prepaints a cached view again from what it prepainted in the frame before, but for its slots: each of those
-/// prepaints as it would in place, in the dispatch node it went under and the context it had. `None` when the frame
-/// before does not match the slots, with the frame left for [`Window::transact`] to take back.
+/// Each slot prepaints as it would in place, in the dispatch node it went under and the context it had. `None` when
+/// the frame before does not match the slots, with the frame left for [`Window::transact`] to take back.
 pub(super) fn replay_prepaint(
     plan: ReplayPlan,
     new_start: PrepaintStateIndex,
@@ -494,7 +489,6 @@ pub(super) fn replay_prepaint(
     Some((replay, slots))
 }
 
-/// Paints a cached view again from what it painted in the frame before, but for its slots, which paint in place.
 /// The view's scene is built again from the operations of the one before, with the chunk each slot puts on it.
 pub(super) fn replay_paint(replay: &mut Replay, window: &mut Window, cx: &mut App) {
     let mut next_run_start = replay.paint.start.clone();

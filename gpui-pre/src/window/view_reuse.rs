@@ -80,8 +80,7 @@ fn within(start: usize, end: usize, len: usize) -> bool {
 }
 
 impl Window {
-    /// Whether the frame before holds everything `range` names, in order, so that carrying it over reads nothing
-    /// out of range.
+    /// Whether carrying `range` over reads nothing out of range.
     pub(crate) fn rendered_frame_holds_prepaint(&self, range: &Range<PrepaintStateIndex>) -> bool {
         let (start, end) = (&range.start, &range.end);
         let frame = &self.rendered_frame;
@@ -155,7 +154,6 @@ impl Window {
         range.start.deferred_draws_index != range.end.deferred_draws_index
     }
 
-    /// Carries over what a prepaint range holds outside the dispatch tree and the deferred draws.
     pub(super) fn reuse_prepaint_buffers(&mut self, range: &Range<PrepaintStateIndex>) {
         self.next_frame.hitboxes.extend(
             self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]

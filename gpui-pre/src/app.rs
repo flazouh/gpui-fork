@@ -1213,9 +1213,8 @@ impl App {
         (result, entities_accessed_in_callback)
     }
 
-    /// Runs `callback` and returns the entities it read or updated, itself: what a scope opened inside it reads is
-    /// that scope's alone. Unlike [`App::detect_accessed_entities`], an entity that something read earlier in the
-    /// frame still counts.
+    /// Unlike [`App::detect_accessed_entities`], an entity that something read earlier in the frame still counts,
+    /// and what a scope opened inside `callback` reads is that scope's alone.
     pub(crate) fn with_read_scope<R>(
         &mut self,
         callback: impl FnOnce(&mut App) -> R,

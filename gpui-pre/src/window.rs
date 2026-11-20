@@ -1199,11 +1199,8 @@ pub struct Window {
     pub(crate) dirty_views: FxHashSet<EntityId>,
     /// Every entity notified for this frame: `dirty_views` without the ancestors it adds.
     pub(crate) self_dirty_views: FxHashSet<EntityId>,
-    /// The cached views that are rendering or replaying their prepaint, innermost last.
     pub(crate) cached_view_prepaints: Vec<crate::retained_view::PrepaintFrame>,
-    /// The cached views that are painting what they rendered or replayed, innermost last.
     pub(crate) cached_view_paints: Vec<crate::retained_view::PaintFrame>,
-    /// How many [`Window::paint_group`] calls are painting, each into a scene of its own.
     pub(crate) group_depth: usize,
     /// Frames drawn so far, this one included while it is drawn.
     pub(crate) frame_number: u64,
@@ -3902,8 +3899,7 @@ impl Window {
             .replay(scene_range, &self.rendered_frame.scene);
     }
 
-    /// Carries over from the last frame what [`Window::reuse_paint`] does, except the scene: a cached view puts its
-    /// own scene on the frame.
+    /// A cached view puts its own scene on the frame.
     pub(crate) fn reuse_paint_except_scene(&mut self, range: Range<PaintIndex>) {
         // Cached elements still exist in the frame even when their paint methods don't run.
         #[cfg(any(test, feature = "test-support"))]

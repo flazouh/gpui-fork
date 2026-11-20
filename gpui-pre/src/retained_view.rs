@@ -47,7 +47,6 @@ struct ViewElementState {
     cache_key: ViewElementCacheKey,
     prepainted: Option<FrameOutput<PrepaintStateIndex>>,
     painted: Option<FrameOutput<PaintIndex>>,
-    /// The frame the view last rendered or replayed in.
     drew_slots_in: u64,
     accessed_entities: FxHashSet<EntityId>,
     /// What the view read while it rendered and painted, outside the cached views inside it. A replay shows none
@@ -169,7 +168,6 @@ impl ViewElementState {
         }
     }
 
-    /// Where the frame before holds the view's output, if the view can be carried over from it.
     fn output_to_carry_over(
         &self,
         cache_key: &ViewElementCacheKey,
@@ -208,7 +206,7 @@ impl ViewElementState {
             .map_or(Plan::Render, Plan::Replay)
     }
 
-    /// Prepaints the view from the frame before. `None` when the view has to render.
+    /// `None` when the view has to render.
     fn carry_over(
         &mut self,
         entity_id: EntityId,
@@ -241,8 +239,6 @@ impl ViewElementState {
         }
     }
 
-    /// Runs `paint` with a scene of the view's own in place of the one the view is drawn on, and keeps what it
-    /// painted.
     fn paint_into_own_scene<R>(
         &mut self,
         paint_start: PaintIndex,
@@ -401,8 +397,8 @@ pub(crate) fn paint(
     })
 }
 
-/// Paints a view that has no state. Only a prepaint of this frame leaves a state, so nothing here is retained: the
-/// view paints as an uncached one does.
+/// Only a prepaint of this frame leaves a state, so a view without one has nothing retained and paints as an
+/// uncached view does.
 fn paint_uncached(
     prepaint: &mut ViewPrepaint,
     window: &mut Window,

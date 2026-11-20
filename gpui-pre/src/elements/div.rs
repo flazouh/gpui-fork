@@ -4083,7 +4083,6 @@ impl GroupHitboxes {
         groups.active -= 1;
     }
 
-    /// How many groups are being painted. What paints inside one may read its hitbox.
     pub fn active(cx: &mut App) -> usize {
         cx.default_global::<Self>().active
     }
