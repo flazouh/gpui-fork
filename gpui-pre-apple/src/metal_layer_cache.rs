@@ -1,7 +1,3 @@
-//! Retained chunks ([`RetainedChunk`]) on Metal. A chunk is drawn in place, with instances of its own. On an opaque
-//! window, a chunk that stays the same from frame to frame is instead drawn once into a texture of its own, its
-//! layer, and each later frame composites the layer as one sprite.
-
 use super::{
     InstanceBinding, InstanceBindings, InstanceBufferWriter, MetalRenderer, SpriteInputIndex,
     SurfaceBounds, build_path_sprite_pipeline_state, build_pipeline_state_with_destination_alpha,
@@ -16,49 +12,79 @@ use gpui::{
 use metal::MTLPixelFormat;
 use std::{collections::HashMap, mem, slice};
 
-/// A chunk gets a layer once it has gone on the frame unchanged this many frames in a row, so that content which
-/// repaints every frame (a pane while it scrolls) never pays for a pass of its own.
+// Content that repaints in every frame (a pane while it scrolls) never pays for a pass of its own.
 const MIN_CLEAN_FRAMES: u32 = 1;
-/// Below this many primitives, drawing a chunk in place costs less than compositing its layer.
+// Below this, drawing a chunk in place costs less than compositing its layer.
 const MIN_PRIMITIVES: usize = 64;
-/// A layer that no frame composited for more than this many frames is dropped.
 const MAX_IDLE_FRAMES: u64 = 4;
-/// The most texture memory the layers of one renderer hold. A chunk that would go past it takes the place of the
-/// layers used longest ago, or is drawn in place when every layer is in use.
+// A chunk that would go past this takes the place of the layers used longest ago, or is drawn in place when every
+// layer is in use.
 const MAX_CACHED_LAYER_BYTES: usize = 64 * 1024 * 1024;
 const BYTES_PER_PIXEL: usize = 4;
 
-/// The pipelines one pass draws its shadows, quads, underlines and sprites with.
-#[derive(Clone, Copy)]
-pub(super) struct PrimitivePipelines<'a> {
-    pub shadows: &'a metal::RenderPipelineStateRef,
-    pub quads: &'a metal::RenderPipelineStateRef,
-    pub underlines: &'a metal::RenderPipelineStateRef,
-    pub monochrome_sprites: &'a metal::RenderPipelineStateRef,
-    pub polychrome_sprites: &'a metal::RenderPipelineStateRef,
+pub(super) struct PrimitivePipelineSet {
+    pub shadows: metal::RenderPipelineState,
+    pub quads: metal::RenderPipelineState,
+    pub underlines: metal::RenderPipelineState,
+    pub monochrome_sprites: metal::RenderPipelineState,
+    pub polychrome_sprites: metal::RenderPipelineState,
+}
+
+impl PrimitivePipelineSet {
+    /// `destination_alpha` is the factor of the target's alpha in the blend. `One` adds the alpha of each primitive
+    /// to an opaque target. `OneMinusSourceAlpha` blends it over a target that starts transparent, which then holds
+    /// premultiplied colour and composites as the same primitives drawn in place would.
+    pub(super) fn build(
+        device: &metal::DeviceRef,
+        library: &metal::LibraryRef,
+        label_prefix: &str,
+        destination_alpha: metal::MTLBlendFactor,
+    ) -> Self {
+        let build = |primitive: &str| {
+            build_pipeline_state_with_destination_alpha(
+                device,
+                library,
+                &format!("{label_prefix}{primitive}s"),
+                &format!("{primitive}_vertex"),
+                &format!("{primitive}_fragment"),
+                MTLPixelFormat::BGRA8Unorm,
+                destination_alpha,
+            )
+        };
+        Self {
+            shadows: build("shadow"),
+            quads: build("quad"),
+            underlines: build("underline"),
+            monochrome_sprites: build("monochrome_sprite"),
+            polychrome_sprites: build("polychrome_sprite"),
+        }
+    }
 }
 
 pub(super) struct MetalLayerCache {
-    shadows_pipeline_state: metal::RenderPipelineState,
-    quads_pipeline_state: metal::RenderPipelineState,
-    underlines_pipeline_state: metal::RenderPipelineState,
-    monochrome_sprites_pipeline_state: metal::RenderPipelineState,
-    polychrome_sprites_pipeline_state: metal::RenderPipelineState,
+    pub(super) pipelines: PrimitivePipelineSet,
     composite_pipeline_state: metal::RenderPipelineState,
     layers: HashMap<u64, Layer>,
     bytes: usize,
-    /// Frames begun so far: the clock of [`Layer::last_used_frame`].
+    /// The chunks of the frame before and of this one, by layer id.
+    seen: HashMap<u64, SeenChunk>,
     frame: u64,
 }
 
 struct Layer {
     generation: u64,
-    /// Where the layer goes on the frame.
     rect: Bounds<DevicePixels>,
     texture: metal::Texture,
     last_used_frame: u64,
-    /// The frame whose command buffer draws into the texture. The texture holds nothing until that is committed.
+    /// The texture holds nothing until the command buffer of this frame is committed.
     drawn_in_frame: u64,
+}
+
+struct SeenChunk {
+    generation: u64,
+    frame: u64,
+    /// Frames in a row, before `frame`, that the chunk went on the frame with this generation.
+    clean_frames: u32,
 }
 
 impl Layer {
@@ -66,7 +92,6 @@ impl Layer {
         texture_bytes(self.rect.size)
     }
 
-    /// The sprite that draws the whole texture over the layer's rect.
     fn sprite(&self, order: u32) -> PolychromeSprite {
         let bounds = Bounds {
             origin: point(
@@ -106,7 +131,7 @@ fn texture_bytes(size: Size<DevicePixels>) -> usize {
     size.width.0.max(0) as usize * size.height.0.max(0) as usize * BYTES_PER_PIXEL
 }
 
-/// The device pixels a layer of `chunk` covers: the chunk's bounds out to whole pixels, cut to the viewport.
+/// The chunk's bounds out to whole device pixels, cut to the viewport.
 fn layer_rect(
     chunk: &RetainedChunk,
     viewport_size: Size<DevicePixels>,
@@ -126,37 +151,12 @@ fn layer_rect(
 
 impl MetalLayerCache {
     pub(super) fn new(device: &metal::DeviceRef, library: &metal::LibraryRef) -> Self {
-        // A layer starts transparent, and its primitives blend their alpha source over where a frame's pipelines
-        // add it. The layer then holds premultiplied colour, which composites over the frame as the same
-        // primitives drawn in place would.
-        let build = |label: &str, vertex: &str, fragment: &str| {
-            build_pipeline_state_with_destination_alpha(
+        Self {
+            pipelines: PrimitivePipelineSet::build(
                 device,
                 library,
-                label,
-                vertex,
-                fragment,
-                MTLPixelFormat::BGRA8Unorm,
+                "layer_",
                 metal::MTLBlendFactor::OneMinusSourceAlpha,
-            )
-        };
-        Self {
-            shadows_pipeline_state: build("layer_shadows", "shadow_vertex", "shadow_fragment"),
-            quads_pipeline_state: build("layer_quads", "quad_vertex", "quad_fragment"),
-            underlines_pipeline_state: build(
-                "layer_underlines",
-                "underline_vertex",
-                "underline_fragment",
-            ),
-            monochrome_sprites_pipeline_state: build(
-                "layer_monochrome_sprites",
-                "monochrome_sprite_vertex",
-                "monochrome_sprite_fragment",
-            ),
-            polychrome_sprites_pipeline_state: build(
-                "layer_polychrome_sprites",
-                "polychrome_sprite_vertex",
-                "polychrome_sprite_fragment",
             ),
             // Premultiplied source over, as the path sprites are composited.
             composite_pipeline_state: build_path_sprite_pipeline_state(
@@ -169,6 +169,7 @@ impl MetalLayerCache {
             ),
             layers: HashMap::new(),
             bytes: 0,
+            seen: HashMap::new(),
             frame: 0,
         }
     }
@@ -179,6 +180,7 @@ impl MetalLayerCache {
 
     pub(super) fn end_frame(&mut self) {
         let frame = self.frame;
+        self.seen.retain(|_, seen| seen.frame == frame);
         self.layers
             .retain(|_, layer| frame - layer.last_used_frame <= MAX_IDLE_FRAMES);
         self.bytes = self.layers.values().map(Layer::bytes).sum();
@@ -193,17 +195,28 @@ impl MetalLayerCache {
 
     pub(super) fn clear(&mut self) {
         self.layers.clear();
+        self.seen.clear();
         self.bytes = 0;
     }
 
-    fn pipelines(&self) -> PrimitivePipelines<'_> {
-        PrimitivePipelines {
-            shadows: &self.shadows_pipeline_state,
-            quads: &self.quads_pipeline_state,
-            underlines: &self.underlines_pipeline_state,
-            monochrome_sprites: &self.monochrome_sprites_pipeline_state,
-            polychrome_sprites: &self.polychrome_sprites_pipeline_state,
+    /// Notes that `chunk` is on this frame. Returns how many frames in a row before this one it was on the frame
+    /// as it is now.
+    fn clean_frames(&mut self, chunk: &RetainedChunk) -> u32 {
+        let frame = self.frame;
+        let new = SeenChunk {
+            generation: chunk.generation,
+            frame,
+            clean_frames: 0,
+        };
+        let seen = self.seen.entry(chunk.layer_id).or_insert(new);
+        if seen.generation != chunk.generation {
+            seen.generation = chunk.generation;
+            seen.clean_frames = 0;
+        } else if seen.frame != frame {
+            seen.clean_frames = seen.clean_frames.saturating_add(1);
         }
+        seen.frame = frame;
+        seen.clean_frames
     }
 
     /// The layer `chunk` composites from in this frame.
@@ -290,14 +303,15 @@ impl MetalRenderer {
         viewport_size: Size<DevicePixels>,
     ) -> Result<()> {
         for chunk in &scene.retained_chunks {
-            if chunk.clean_frames >= MIN_CLEAN_FRAMES
+            if self.layer_cache.clean_frames(chunk) >= MIN_CLEAN_FRAMES
                 && let Some(rect) = layer_rect(chunk, viewport_size)
             {
                 if self.layer_cache.keep(chunk, rect) {
                     continue;
                 }
-                if chunk.scene.total_primitive_count() >= MIN_PRIMITIVES
-                    && chunk.scene.is_translation_invariant()
+                let summary = chunk.scene.summary();
+                if summary.primitive_count >= MIN_PRIMITIVES
+                    && summary.is_translation_invariant
                     && self.draw_layer(chunk, rect, writer, command_buffer)?
                 {
                     continue;
@@ -334,7 +348,7 @@ impl MetalRenderer {
         self.encode_scene(
             &chunk.scene,
             &bindings,
-            self.layer_cache.pipelines(),
+            &self.layer_cache.pipelines,
             writer,
             &texture,
             rect.size,
@@ -346,7 +360,6 @@ impl MetalRenderer {
         Ok(true)
     }
 
-    /// Draws a layer over its rect: one sprite whose texture holds premultiplied colour.
     pub(super) fn composite_layer(
         &self,
         layer: &LayerBinding,
@@ -385,9 +398,9 @@ impl MetalRenderer {
     }
 }
 
-/// The instances of a scene, and what draws each of its retained chunks, by the chunk's index.
 pub(super) struct SceneBindings {
     pub own: InstanceBindings,
+    /// By the chunk's index in [`Scene::retained_chunks`].
     pub chunks: Vec<ChunkBindings>,
 }
 
@@ -396,7 +409,6 @@ pub(super) enum ChunkBindings {
     Layer(LayerBinding),
 }
 
-/// What a frame needs to composite a layer.
 pub(super) struct LayerBinding {
     sprite: InstanceBinding,
     texture: metal::Texture,
@@ -433,8 +445,7 @@ pub(super) fn write_scene_instances(
     Ok(SceneBindings { own, chunks })
 }
 
-/// The instances of a scene that is translation invariant ([`Scene::is_translation_invariant`]), moved back by
-/// `origin`.
+/// The scene must be translation invariant ([`gpui::SceneSummary::is_translation_invariant`]).
 fn write_moved_instances(
     scene: &Scene,
     writer: &mut InstanceBufferWriter,
@@ -575,18 +586,12 @@ mod tests {
         Arc::new(scene)
     }
 
-    fn chunk(
-        content: &Arc<Scene>,
-        layer_id: u64,
-        generation: u64,
-        clean_frames: u32,
-    ) -> RetainedChunk {
+    fn chunk(content: &Arc<Scene>, layer_id: u64, generation: u64) -> RetainedChunk {
         RetainedChunk {
             order: 0,
             bounds: content.covered_bounds().unwrap(),
             layer_id,
             generation,
-            clean_frames,
             scene: content.clone(),
         }
     }
@@ -627,24 +632,31 @@ mod tests {
             .unwrap()
     }
 
-    /// The frame with the chunk drawn in place, drawn into a new layer, and composited from the kept layer.
+    /// Three frames of one renderer with the same chunk: drawn in place, drawn into a new layer, and composited
+    /// from the kept layer.
     fn in_place_and_layered(content: &Arc<Scene>) -> (RgbaImage, RgbaImage, RgbaImage) {
-        assert!(content.total_primitive_count() >= MIN_PRIMITIVES);
-        let in_place = render(&mut renderer(), &frame(Some(chunk(content, 1, 1, 0))));
-        let without = render(&mut renderer(), &frame(None));
+        assert!(content.summary().primitive_count >= MIN_PRIMITIVES);
+        let scene = frame(Some(chunk(content, 1, 1)));
+        let mut renderer = renderer();
+
+        let in_place = render(&mut renderer, &scene);
+        assert!(
+            renderer.layer_cache.layers.is_empty(),
+            "a chunk in its first frame has no layer"
+        );
+        let without = render(&mut self::renderer(), &frame(None));
         assert!(
             greatest_difference(&in_place, &without) > 100,
             "the chunk shows on the frame"
         );
 
-        let mut renderer = renderer();
-        let drawn = render(&mut renderer, &frame(Some(chunk(content, 1, 1, 1))));
+        let drawn = render(&mut renderer, &scene);
         assert_eq!(
             renderer.layer_cache.layers.len(),
             1,
             "the clean chunk has a layer"
         );
-        let kept = render(&mut renderer, &frame(Some(chunk(content, 1, 1, 2))));
+        let kept = render(&mut renderer, &scene);
         (in_place, drawn, kept)
     }
 
@@ -715,13 +727,16 @@ mod tests {
             content(37.5, 53.25, 0.4, true),
         );
         let mut renderer = renderer();
-        render(&mut renderer, &frame(Some(chunk(&first, 1, 1, 1))));
+        for _ in 0..2 {
+            render(&mut renderer, &frame(Some(chunk(&first, 1, 1))));
+        }
+        assert_eq!(renderer.layer_cache.layers[&1].generation, 1);
 
-        let repainted = render(&mut renderer, &frame(Some(chunk(&second, 1, 2, 0))));
-        let in_place = render(&mut self::renderer(), &frame(Some(chunk(&second, 1, 2, 0))));
+        let repainted = render(&mut renderer, &frame(Some(chunk(&second, 1, 2))));
+        let in_place = render(&mut self::renderer(), &frame(Some(chunk(&second, 1, 2))));
         assert_eq!(greatest_difference(&repainted, &in_place), 0);
 
-        let layered = render(&mut renderer, &frame(Some(chunk(&second, 1, 2, 1))));
+        let layered = render(&mut renderer, &frame(Some(chunk(&second, 1, 2))));
         assert_eq!(greatest_difference(&layered, &in_place), 0);
         assert_eq!(
             renderer.layer_cache.layers[&1].generation, 2,
@@ -730,17 +745,31 @@ mod tests {
     }
 
     #[test]
+    fn a_chunk_that_was_off_the_frame_starts_again_without_a_layer() {
+        let content = content(37.5, 53.25, 0., true);
+        let mut renderer = renderer();
+        render(&mut renderer, &frame(Some(chunk(&content, 1, 1))));
+        render(&mut renderer, &frame(None));
+
+        render(&mut renderer, &frame(Some(chunk(&content, 1, 1))));
+        assert!(
+            renderer.layer_cache.layers.is_empty(),
+            "the two frames the chunk was on are not in a row"
+        );
+        render(&mut renderer, &frame(Some(chunk(&content, 1, 1))));
+        assert_eq!(renderer.layer_cache.layers.len(), 1);
+    }
+
+    #[test]
     fn a_window_that_is_not_opaque_draws_every_chunk_in_place() {
         let content = content(37.5, 53.25, 0., false);
+        let scene = frame(Some(chunk(&content, 1, 1)));
         let mut transparent = renderer();
         transparent.update_transparency(true);
-        let clean = render(&mut transparent, &frame(Some(chunk(&content, 1, 1, 3))));
+        let first = render(&mut transparent, &scene);
+        let clean = render(&mut transparent, &scene);
         assert!(transparent.layer_cache.layers.is_empty());
-
-        let mut in_place = renderer();
-        in_place.update_transparency(true);
-        let dirty = render(&mut in_place, &frame(Some(chunk(&content, 1, 1, 0))));
-        assert_eq!(greatest_difference(&clean, &dirty), 0);
+        assert_eq!(greatest_difference(&clean, &first), 0);
     }
 
     /// 64 quads spread over a square of 2048 device pixels: a layer of 16 MiB, a quarter of what the cache holds.
@@ -777,23 +806,30 @@ mod tests {
         let mut renderer = renderer();
 
         // Five clean chunks in one frame: four get a layer, the fifth is drawn in place.
-        let five = frame_of((1..=5).map(|layer_id| chunk(&content, layer_id, 1, 1)));
-        renderer.render_scene(&five, viewport).unwrap();
+        let five = frame_of((1..=5).map(|layer_id| chunk(&content, layer_id, 1)));
+        for _ in 0..2 {
+            renderer.render_scene(&five, viewport).unwrap();
+        }
         assert_eq!(renderer.layer_cache.layers.len(), 4);
         assert_eq!(renderer.layer_cache.bytes, MAX_CACHED_LAYER_BYTES);
 
-        // A sixth chunk alone in the next frame takes the place of a layer that frame does not use.
-        let sixth = frame_of([chunk(&content, 6, 1, 1)]);
-        renderer.render_scene(&sixth, viewport).unwrap();
+        // A sixth chunk alone on the frame takes the place of a layer that frame does not use.
+        let sixth = frame_of([chunk(&content, 6, 1)]);
+        for _ in 0..2 {
+            renderer.render_scene(&sixth, viewport).unwrap();
+        }
         assert!(renderer.layer_cache.layers.contains_key(&6));
         assert_eq!(renderer.layer_cache.layers.len(), 4);
         assert_eq!(renderer.layer_cache.bytes, MAX_CACHED_LAYER_BYTES);
 
-        // The layers no frame uses any more are dropped after `MAX_IDLE_FRAMES` frames.
         for _ in 0..MAX_IDLE_FRAMES {
             renderer.render_scene(&sixth, viewport).unwrap();
         }
-        assert_eq!(renderer.layer_cache.layers.len(), 1);
+        assert_eq!(
+            renderer.layer_cache.layers.len(),
+            1,
+            "a layer no frame used for more than MAX_IDLE_FRAMES frames is dropped"
+        );
         assert_eq!(renderer.layer_cache.bytes, layer_bytes);
 
         renderer.destroy();

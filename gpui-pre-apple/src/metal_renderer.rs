@@ -30,7 +30,7 @@ use std::{cell::Cell, ffi::c_void, mem, mem::MaybeUninit, ops::Range, ptr, slice
 #[path = "metal_layer_cache.rs"]
 mod layer_cache;
 use layer_cache::{
-    ChunkBindings, MetalLayerCache, PrimitivePipelines, SceneBindings, write_scene_instances,
+    ChunkBindings, MetalLayerCache, PrimitivePipelineSet, SceneBindings, write_scene_instances,
 };
 
 // Exported to metal
@@ -126,11 +126,7 @@ pub struct MetalRenderer {
     command_queue: CommandQueue,
     paths_rasterization_pipeline_state: metal::RenderPipelineState,
     path_sprites_pipeline_state: metal::RenderPipelineState,
-    shadows_pipeline_state: metal::RenderPipelineState,
-    quads_pipeline_state: metal::RenderPipelineState,
-    underlines_pipeline_state: metal::RenderPipelineState,
-    monochrome_sprites_pipeline_state: metal::RenderPipelineState,
-    polychrome_sprites_pipeline_state: metal::RenderPipelineState,
+    primitive_pipelines: PrimitivePipelineSet,
     surfaces_pipeline_state: metal::RenderPipelineState,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
@@ -282,46 +278,8 @@ impl MetalRenderer {
             "path_sprite_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
-        let shadows_pipeline_state = build_pipeline_state(
-            &device,
-            &library,
-            "shadows",
-            "shadow_vertex",
-            "shadow_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let quads_pipeline_state = build_pipeline_state(
-            &device,
-            &library,
-            "quads",
-            "quad_vertex",
-            "quad_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let underlines_pipeline_state = build_pipeline_state(
-            &device,
-            &library,
-            "underlines",
-            "underline_vertex",
-            "underline_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let monochrome_sprites_pipeline_state = build_pipeline_state(
-            &device,
-            &library,
-            "monochrome_sprites",
-            "monochrome_sprite_vertex",
-            "monochrome_sprite_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let polychrome_sprites_pipeline_state = build_pipeline_state(
-            &device,
-            &library,
-            "polychrome_sprites",
-            "polychrome_sprite_vertex",
-            "polychrome_sprite_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-        );
+        let primitive_pipelines =
+            PrimitivePipelineSet::build(&device, &library, "", metal::MTLBlendFactor::One);
         let surfaces_pipeline_state = build_pipeline_state(
             &device,
             &library,
@@ -347,11 +305,7 @@ impl MetalRenderer {
             command_queue,
             paths_rasterization_pipeline_state,
             path_sprites_pipeline_state,
-            shadows_pipeline_state,
-            quads_pipeline_state,
-            underlines_pipeline_state,
-            monochrome_sprites_pipeline_state,
-            polychrome_sprites_pipeline_state,
+            primitive_pipelines,
             surfaces_pipeline_state,
             unit_vertices,
             instance_buffer_pool,
@@ -401,7 +355,19 @@ impl MetalRenderer {
                 ];
             }
         }
-        self.update_path_intermediate_textures(size);
+        self.ensure_path_intermediate_textures(size);
+    }
+
+    fn ensure_path_intermediate_textures(&mut self, size: Size<DevicePixels>) {
+        let fit = self
+            .path_intermediate_texture
+            .as_ref()
+            .is_some_and(|texture| {
+                texture.width() == size.width.0 as u64 && texture.height() == size.height.0 as u64
+            });
+        if !fit {
+            self.update_path_intermediate_textures(size);
+        }
     }
 
     fn update_path_intermediate_textures(&mut self, size: Size<DevicePixels>) {
@@ -621,7 +587,7 @@ impl MetalRenderer {
         // autoreleased command buffers and render-pass descriptors.
         objc2::rc::autoreleasepool(|_| {
             // Update path intermediate textures for this size
-            self.update_path_intermediate_textures(size);
+            self.ensure_path_intermediate_textures(size);
 
             // Create an offscreen texture as render target
             let texture_descriptor = metal::TextureDescriptor::new();
@@ -667,17 +633,7 @@ impl MetalRenderer {
         }
 
         objc2::rc::autoreleasepool(|_| {
-            // As a window does, which makes its path textures only when its drawable size changes.
-            let path_textures_fit =
-                self.path_intermediate_texture
-                    .as_ref()
-                    .is_some_and(|texture| {
-                        texture.width() == size.width.0 as u64
-                            && texture.height() == size.height.0 as u64
-                    });
-            if !path_textures_fit {
-                self.update_path_intermediate_textures(size);
-            }
+            self.ensure_path_intermediate_textures(size);
 
             let needs_new_target = self.headless_render_target.as_ref().is_none_or(|texture| {
                 texture.width() != size.width.0 as u64 || texture.height() != size.height.0 as u64
@@ -728,7 +684,7 @@ impl MetalRenderer {
         self.encode_scene(
             scene,
             bindings,
-            self.frame_pipelines(),
+            &self.primitive_pipelines,
             writer,
             texture,
             viewport_size,
@@ -741,24 +697,13 @@ impl MetalRenderer {
         Ok(())
     }
 
-    fn frame_pipelines(&self) -> PrimitivePipelines<'_> {
-        PrimitivePipelines {
-            shadows: &self.shadows_pipeline_state,
-            quads: &self.quads_pipeline_state,
-            underlines: &self.underlines_pipeline_state,
-            monochrome_sprites: &self.monochrome_sprites_pipeline_state,
-            polychrome_sprites: &self.polychrome_sprites_pipeline_state,
-        }
-    }
-
-    /// Encodes the batches of `scene` in order with `pipelines`, a retained chunk's own scene included, in its
-    /// place. When this fails, the encoder has ended.
+    /// When this fails, the encoder has ended.
     #[allow(clippy::too_many_arguments)]
     fn encode_scene<'a>(
         &self,
         scene: &Scene,
         bindings: &SceneBindings,
-        pipelines: PrimitivePipelines<'_>,
+        pipelines: &PrimitivePipelineSet,
         writer: &mut InstanceBufferWriter,
         texture: &'a metal::TextureRef,
         viewport_size: Size<DevicePixels>,
@@ -769,14 +714,14 @@ impl MetalRenderer {
         for batch in scene.batches() {
             match batch {
                 PrimitiveBatch::Shadows(range) => self.draw_shadows(
-                    pipelines.shadows,
+                    &pipelines.shadows,
                     range,
                     instance_bindings,
                     viewport_size,
                     command_encoder,
                 ),
                 PrimitiveBatch::Quads(range) => self.draw_quads(
-                    pipelines.quads,
+                    &pipelines.quads,
                     range,
                     instance_bindings,
                     viewport_size,
@@ -813,7 +758,7 @@ impl MetalRenderer {
                     }
                 }
                 PrimitiveBatch::Underlines(range) => self.draw_underlines(
-                    pipelines.underlines,
+                    &pipelines.underlines,
                     range,
                     instance_bindings,
                     viewport_size,
@@ -821,7 +766,7 @@ impl MetalRenderer {
                 ),
                 PrimitiveBatch::MonochromeSprites { texture_id, range } => self
                     .draw_monochrome_sprites(
-                        pipelines.monochrome_sprites,
+                        &pipelines.monochrome_sprites,
                         texture_id,
                         range,
                         instance_bindings,
@@ -830,7 +775,7 @@ impl MetalRenderer {
                     ),
                 PrimitiveBatch::PolychromeSprites { texture_id, range } => self
                     .draw_polychrome_sprites(
-                        pipelines.polychrome_sprites,
+                        &pipelines.polychrome_sprites,
                         texture_id,
                         range,
                         instance_bindings,

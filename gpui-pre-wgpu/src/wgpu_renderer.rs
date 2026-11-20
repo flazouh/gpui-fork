@@ -1616,7 +1616,7 @@ impl WgpuRenderer {
                     label: Some("main_encoder"),
                 });
 
-        if has_backdrop_group(scene) {
+        if scene.summary().has_backdrop_group {
             // A group filters what is under it, which is read from its target: the window's texture cannot be.
             // The root scene goes into a surface of its own and the frame is copied from it.
             let root = self.root_view();
@@ -1993,8 +1993,6 @@ impl WgpuRenderer {
         )
     }
 
-    /// [`Self::record_scene`] with what the first pass does to `target`: a retained chunk's scene is drawn over
-    /// what the target holds.
     fn record_scene_with_load(
         &mut self,
         scene: &Scene,
@@ -2095,8 +2093,15 @@ impl WgpuRenderer {
                     }
                     PrimitiveBatch::RetainedChunks(range) => {
                         for chunk in &scene.retained_chunks[range] {
-                            if fits_in_one_pass(&chunk.scene) {
-                                self.record_scene_in_pass(&chunk.scene, instance_offset, &mut pass)?;
+                            // A path is rasterized in a pass of its own, and a group is painted into a surface
+                            // of its own.
+                            let summary = chunk.scene.summary();
+                            if !summary.has_paths && !summary.has_groups {
+                                self.record_scene_in_pass(
+                                    &chunk.scene,
+                                    instance_offset,
+                                    &mut pass,
+                                )?;
                             } else {
                                 drop(pass);
                                 self.record_scene_with_load(
@@ -2132,7 +2137,7 @@ impl WgpuRenderer {
         Ok(())
     }
 
-    /// Draws a scene that [`fits_in_one_pass`] in the pass it is given: a retained chunk drawn in place.
+    /// The scene must hold no path and no group, which end the pass they are drawn in.
     fn record_scene_in_pass(
         &mut self,
         scene: &Scene,
@@ -2153,8 +2158,7 @@ impl WgpuRenderer {
         Ok(())
     }
 
-    /// Draws a batch that needs nothing but its instances and the pass. Paths, groups and retained chunks need
-    /// the encoder, and their callers draw them.
+    /// Paths, groups and retained chunks need the encoder, so their callers draw them.
     fn draw_batch_in_pass(
         &self,
         batch: PrimitiveBatch,
@@ -2813,29 +2817,6 @@ impl WgpuRenderer {
 
 fn instance_range(range: Range<usize>) -> Range<u32> {
     range.start as u32..range.end as u32
-}
-
-/// Whether nothing of the scene, its retained chunks included, ends the pass it is drawn in: a path is rasterized
-/// in a pass of its own, and a group is painted into a surface of its own.
-fn fits_in_one_pass(scene: &Scene) -> bool {
-    scene.paths.is_empty()
-        && scene.groups.is_empty()
-        && scene
-            .retained_chunks
-            .iter()
-            .all(|chunk| fits_in_one_pass(&chunk.scene))
-}
-
-/// Whether a group of the scene, or of a retained chunk drawn in place on it, filters what is under it.
-fn has_backdrop_group(scene: &Scene) -> bool {
-    scene
-        .groups
-        .iter()
-        .any(|group| group.effects.backdrop.is_some())
-        || scene
-            .retained_chunks
-            .iter()
-            .any(|chunk| has_backdrop_group(&chunk.scene))
 }
 
 #[cfg(not(target_family = "wasm"))]

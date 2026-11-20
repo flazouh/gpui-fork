@@ -99,7 +99,6 @@ struct RetainedPaint {
     /// One id for the view's whole life at its place in the element tree.
     layer_id: u64,
     generation: u64,
-    clean_frames: u32,
     scene: Option<Arc<Scene>>,
     /// The scene before `scene`. The next paint takes over its allocations once no frame holds it.
     spare: Option<Arc<Scene>>,
@@ -111,7 +110,6 @@ impl RetainedPaint {
         Self {
             layer_id: NEXT_LAYER_ID.fetch_add(1, Ordering::Relaxed),
             generation: 0,
-            clean_frames: 0,
             scene: None,
             spare: None,
         }
@@ -130,12 +128,7 @@ impl RetainedPaint {
     fn repainted(&mut self, mut scene: Scene) {
         scene.finish();
         self.generation += 1;
-        self.clean_frames = 0;
         self.spare = self.scene.replace(Arc::new(scene));
-    }
-
-    fn kept_clean(&mut self) {
-        self.clean_frames = self.clean_frames.saturating_add(1);
     }
 
     fn chunk(&self) -> Option<RetainedChunk> {
@@ -145,7 +138,6 @@ impl RetainedPaint {
             bounds: scene.covered_bounds()?,
             layer_id: self.layer_id,
             generation: self.generation,
-            clean_frames: self.clean_frames,
             scene: scene.clone(),
         })
     }
@@ -388,10 +380,7 @@ pub(crate) fn paint(
                     });
                 state.own_reads.extend(own_reads);
             }
-            Outcome::Reused { paint } => {
-                window.reuse_paint_except_scene(paint.clone());
-                state.retained.kept_clean();
-            }
+            Outcome::Reused { paint } => window.reuse_paint_except_scene(paint.clone()),
             Outcome::Replayed(replay) => {
                 state.paint_into_own_scene(paint_start.clone(), window, cx, |window, cx| {
                     replay_paint(replay, window, cx)

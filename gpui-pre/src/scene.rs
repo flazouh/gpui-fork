@@ -56,6 +56,7 @@ pub struct Scene {
     /// Content of cached views, each put on the scene as one: see [`RetainedChunk`].
     pub retained_chunks: Vec<RetainedChunk>,
     covered: Option<Bounds<ScaledPixels>>,
+    summary: SceneSummary,
 }
 
 /// What a cached view painted, kept from the frame it painted in and put on its parent's scene as one entry, so
@@ -71,10 +72,25 @@ pub struct RetainedChunk {
     pub layer_id: u64,
     /// Rises each time the view paints again.
     pub generation: u64,
-    /// Frames in a row the view has been put on the scene without painting again.
-    pub clean_frames: u32,
     /// The content, finished.
     pub scene: Arc<Scene>,
+}
+
+/// What a renderer asks of a whole scene, with its retained chunks counted in. [`Scene::finish`] works it out once.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SceneSummary {
+    /// Primitives on the scene, with those of its retained chunks counted as if they were on it.
+    pub primitive_count: usize,
+    /// Whether moving every primitive by whole device pixels, to draw the scene into a target of its own, moves
+    /// its pixels and changes none of them. Paths, surfaces, groups, subpixel and transformed sprites, and the
+    /// dither of a linear gradient are drawn through the window's own coordinates, so a scene with any is not.
+    pub is_translation_invariant: bool,
+    /// Whether the scene holds a [`Group`].
+    pub has_groups: bool,
+    /// Whether the scene holds a path.
+    pub has_paths: bool,
+    /// Whether a group of the scene filters what is under it ([`GroupEffects::backdrop`]).
+    pub has_backdrop_group: bool,
 }
 
 /// What a [`Group`] does to its content when it is put on the scene.
@@ -238,6 +254,7 @@ impl Scene {
         self.groups.clear();
         self.retained_chunks.clear();
         self.covered = None;
+        self.summary = SceneSummary::default();
     }
 
     /// The union of the clipped bounds of everything on the scene, `None` while it is empty.
@@ -252,50 +269,43 @@ impl Scene {
         });
     }
 
-    /// Primitives on the scene, with those of its retained chunks counted as if they were on it.
-    pub fn total_primitive_count(&self) -> usize {
-        self.quads.len()
-            + self.shadows.len()
-            + self.paths.len()
-            + self.underlines.len()
-            + self.monochrome_sprites.len()
-            + self.subpixel_sprites.len()
-            + self.polychrome_sprites.len()
-            + self
-                .retained_chunks
-                .iter()
-                .map(|chunk| chunk.scene.total_primitive_count())
-                .sum::<usize>()
+    /// What [`Scene::finish`] worked out. It is out of date while the scene is not finished.
+    pub fn summary(&self) -> SceneSummary {
+        self.summary
     }
 
-    /// Whether moving every primitive by whole device pixels, to draw the scene into a target of its own, moves
-    /// its pixels and changes none of them. Paths, surfaces, groups, subpixel and transformed sprites, and the
-    /// dither of a linear gradient are drawn through the window's own coordinates, so a scene with any is not.
-    pub fn is_translation_invariant(&self) -> bool {
-        self.paths.is_empty()
-            && self.surfaces.is_empty()
-            && self.groups.is_empty()
-            && self.subpixel_sprites.is_empty()
-            && self
-                .quads
+    fn summarize(&self) -> SceneSummary {
+        let chunks = || self.retained_chunks.iter().map(|chunk| chunk.scene.summary);
+        SceneSummary {
+            primitive_count: self.quads.len()
+                + self.shadows.len()
+                + self.paths.len()
+                + self.underlines.len()
+                + self.monochrome_sprites.len()
+                + self.subpixel_sprites.len()
+                + self.polychrome_sprites.len()
+                + chunks().map(|chunk| chunk.primitive_count).sum::<usize>(),
+            is_translation_invariant: self.paths.is_empty()
+                && self.surfaces.is_empty()
+                && self.groups.is_empty()
+                && self.subpixel_sprites.is_empty()
+                && self
+                    .quads
+                    .iter()
+                    .all(|quad| quad.background.tag != crate::color::BackgroundTag::LinearGradient)
+                && self
+                    .monochrome_sprites
+                    .iter()
+                    .all(|sprite| sprite.transformation == TransformationMatrix::unit())
+                && chunks().all(|chunk| chunk.is_translation_invariant),
+            has_groups: !self.groups.is_empty() || chunks().any(|chunk| chunk.has_groups),
+            has_paths: !self.paths.is_empty() || chunks().any(|chunk| chunk.has_paths),
+            has_backdrop_group: self
+                .groups
                 .iter()
-                .all(|quad| quad.background.tag != crate::color::BackgroundTag::LinearGradient)
-            && self
-                .monochrome_sprites
-                .iter()
-                .all(|sprite| sprite.transformation == TransformationMatrix::unit())
-            && self
-                .retained_chunks
-                .iter()
-                .all(|chunk| chunk.scene.is_translation_invariant())
-    }
-
-    fn has_groups(&self) -> bool {
-        !self.groups.is_empty()
-            || self
-                .retained_chunks
-                .iter()
-                .any(|chunk| chunk.scene.has_groups())
+                .any(|group| group.effects.backdrop.is_some())
+                || chunks().any(|chunk| chunk.has_backdrop_group),
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -458,7 +468,7 @@ impl Scene {
     /// renderer that cannot composite a group. Two shapes of a group that overlap show through each other where a
     /// group would show one surface, and a colour matrix is left out. `None` when the scene has no group.
     pub fn flattened(&self) -> Option<Scene> {
-        if !self.has_groups() {
+        if !self.summary.has_groups {
             return None;
         }
         let mut flat = Scene::default();
@@ -506,6 +516,7 @@ impl Scene {
         self.surfaces.sort_by_key(|surface| surface.order);
         self.groups.sort_by_key(|group| group.order);
         self.retained_chunks.sort_by_key(|chunk| chunk.order);
+        self.summary = self.summarize();
     }
 
     #[cfg_attr(
