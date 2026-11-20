@@ -323,7 +323,12 @@ impl Scene {
         if clipped_bounds.is_empty() {
             return;
         }
-        self.cover(clipped_bounds);
+        self.cover(match &primitive {
+            Primitive::Shadow(shadow) => {
+                shadow.drawn_bounds().intersect(&shadow.content_mask.bounds)
+            }
+            _ => clipped_bounds,
+        });
 
         let order = self
             .layer_stack
@@ -1001,6 +1006,18 @@ pub struct Shadow {
     /// 0 = drop shadow (rendered outside the element), 1 = inset shadow (rendered inside).
     pub inset: u32,
     pub pad: u32, // align to 8 bytes
+}
+
+impl Shadow {
+    /// What the shaders draw for the shadow, before its content mask: an inset shadow fills its element, and a
+    /// drop shadow blurs out to three radii past its bounds.
+    pub fn drawn_bounds(&self) -> Bounds<ScaledPixels> {
+        if self.inset != 0 {
+            self.element_bounds
+        } else {
+            self.bounds.dilate(self.blur_radius * 3.0)
+        }
+    }
 }
 
 impl From<Shadow> for Primitive {

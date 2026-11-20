@@ -676,6 +676,38 @@ mod tests {
         );
     }
 
+    fn card_with_a_shadow() -> Arc<Scene> {
+        let everything = bounds(0., 0., 400., 300.);
+        let card = bounds(120., 100., 160., 80.);
+        let mut scene = Scene::default();
+        scene.insert_primitive(Shadow {
+            order: 0,
+            blur_radius: ScaledPixels(15.),
+            bounds: card,
+            corner_radii: Corners::all(ScaledPixels(6.)),
+            content_mask: ContentMask { bounds: everything },
+            color: hsla(0., 0., 0., 0.6),
+            element_bounds: card,
+            element_corner_radii: Corners::all(ScaledPixels(6.)),
+            inset: 0,
+            pad: 0,
+        });
+        for index in 0..MIN_PRIMITIVES {
+            let (column, row) = ((index % 16) as f32, (index / 16) as f32);
+            let cell = bounds(120. + column * 10., 100. + row * 20., 10., 20.);
+            scene.insert_primitive(plain_quad(cell, hsla(column / 16., 0.6, 0.5, 1.)));
+        }
+        scene.finish();
+        Arc::new(scene)
+    }
+
+    #[test]
+    fn the_blur_of_a_shadow_past_its_bounds_is_on_the_layer() {
+        let (in_place, drawn, kept) = in_place_and_layered(&card_with_a_shadow());
+        assert!(greatest_difference(&in_place, &drawn) <= 1);
+        assert!(greatest_difference(&in_place, &kept) <= 1);
+    }
+
     #[test]
     fn a_chunk_that_painted_again_is_not_composited_from_its_old_layer() {
         let (first, second) = (
