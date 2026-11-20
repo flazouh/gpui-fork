@@ -27,6 +27,12 @@ use parking_lot::Mutex;
 
 use std::{cell::Cell, ffi::c_void, mem, mem::MaybeUninit, ops::Range, ptr, slice, sync::Arc};
 
+#[path = "metal_layer_cache.rs"]
+mod layer_cache;
+use layer_cache::{
+    ChunkBindings, MetalLayerCache, PrimitivePipelines, SceneBindings, write_scene_instances,
+};
+
 // Exported to metal
 pub(crate) type PointF = gpui::Point<f32>;
 
@@ -138,6 +144,7 @@ pub struct MetalRenderer {
     /// rendering headlessly without reading pixels back.
     #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
     headless_render_target: Option<metal::Texture>,
+    layer_cache: MetalLayerCache,
 }
 
 #[repr(C)]
@@ -328,6 +335,7 @@ impl MetalRenderer {
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu));
         let core_video_texture_cache =
             CVMetalTextureCache::new(None, device.clone(), None).unwrap();
+        let layer_cache = MetalLayerCache::new(&device, &library);
 
         Self {
             device,
@@ -354,6 +362,7 @@ impl MetalRenderer {
             path_sample_count: PATH_SAMPLE_COUNT,
             #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
             headless_render_target: None,
+            layer_cache,
         }
     }
 
@@ -440,8 +449,8 @@ impl MetalRenderer {
         }
     }
 
-    pub fn destroy(&self) {
-        // nothing to do
+    pub fn destroy(&mut self) {
+        self.layer_cache.clear();
     }
 
     pub fn draw(&mut self, scene: &Scene) {
@@ -502,25 +511,17 @@ impl MetalRenderer {
             &self.instance_buffer_pool,
             self.is_unified_memory,
         );
-        let instance_bindings = write_instances(scene, &mut writer).with_context(|| {
-            format!(
-                "scene too large: {} paths, {} shadows, {} quads, {} underlines, {} mono, {} poly, {} surfaces",
-                scene.paths.len(),
-                scene.shadows.len(),
-                scene.quads.len(),
-                scene.underlines.len(),
-                scene.monochrome_sprites.len(),
-                scene.polychrome_sprites.len(),
-                scene.surfaces.len(),
-            )
-        })?;
-        let command_buffer = self.draw_primitives_to_texture(
-            scene,
-            &instance_bindings,
-            &mut writer,
-            texture,
-            viewport_size,
-        )?;
+        let command_queue = self.command_queue.clone();
+        let command_buffer = command_queue.new_command_buffer();
+        self.layer_cache.begin_frame();
+        if let Err(error) =
+            self.encode_frame(scene, &mut writer, texture, viewport_size, command_buffer)
+        {
+            // The command buffer is dropped without a commit, so no layer it draws into is ever drawn.
+            self.layer_cache.forget_frame();
+            return Err(error);
+        }
+        self.layer_cache.end_frame();
 
         let instance_buffer_pool = self.instance_buffer_pool.clone();
         let instance_buffer = Cell::new(Some(writer.finish()));
@@ -532,7 +533,42 @@ impl MetalRenderer {
         let block = block.copy();
         command_buffer.add_completed_handler(&block);
 
-        Ok(command_buffer)
+        Ok(command_buffer.to_owned())
+    }
+
+    fn encode_frame(
+        &mut self,
+        scene: &Scene,
+        writer: &mut InstanceBufferWriter,
+        texture: &metal::TextureRef,
+        viewport_size: Size<DevicePixels>,
+        command_buffer: &metal::CommandBufferRef,
+    ) -> Result<()> {
+        // A layer holds its own alpha, which would stand in for the alpha of a window that is not opaque.
+        if self.opaque {
+            self.refresh_layers(scene, writer, command_buffer, viewport_size)?;
+        }
+        let bindings = write_scene_instances(scene, writer, None, Some(&self.layer_cache))
+            .with_context(|| {
+                format!(
+                    "scene too large: {} paths, {} shadows, {} quads, {} underlines, {} mono, {} poly, {} surfaces",
+                    scene.paths.len(),
+                    scene.shadows.len(),
+                    scene.quads.len(),
+                    scene.underlines.len(),
+                    scene.monochrome_sprites.len(),
+                    scene.polychrome_sprites.len(),
+                    scene.surfaces.len(),
+                )
+            })?;
+        self.draw_primitives_to_texture(
+            scene,
+            &bindings,
+            writer,
+            texture,
+            viewport_size,
+            command_buffer,
+        )
     }
 
     /// Renders the scene to a texture and returns the pixel data as an RGBA image.
@@ -631,7 +667,17 @@ impl MetalRenderer {
         }
 
         objc2::rc::autoreleasepool(|_| {
-            self.update_path_intermediate_textures(size);
+            // As a window does, which makes its path textures only when its drawable size changes.
+            let path_textures_fit =
+                self.path_intermediate_texture
+                    .as_ref()
+                    .is_some_and(|texture| {
+                        texture.width() == size.width.0 as u64
+                            && texture.height() == size.height.0 as u64
+                    });
+            if !path_textures_fit {
+                self.update_path_intermediate_textures(size);
+            }
 
             let needs_new_target = self.headless_render_target.as_ref().is_none_or(|texture| {
                 texture.width() != size.width.0 as u64 || texture.height() != size.height.0 as u64
@@ -664,13 +710,12 @@ impl MetalRenderer {
     fn draw_primitives_to_texture(
         &mut self,
         scene: &Scene,
-        instance_bindings: &InstanceBindings,
+        bindings: &SceneBindings,
         writer: &mut InstanceBufferWriter,
         texture: &metal::TextureRef,
         viewport_size: Size<DevicePixels>,
-    ) -> Result<metal::CommandBuffer> {
-        let command_queue = self.command_queue.clone();
-        let command_buffer = command_queue.new_command_buffer();
+        command_buffer: &metal::CommandBufferRef,
+    ) -> Result<()> {
         let alpha = if self.opaque { 1. } else { 0. };
 
         let mut command_encoder = new_command_encoder_for_texture(
@@ -680,14 +725,63 @@ impl MetalRenderer {
             Some(metal::MTLClearColor::new(0., 0., 0., alpha)),
         );
 
+        self.encode_scene(
+            scene,
+            bindings,
+            self.frame_pipelines(),
+            writer,
+            texture,
+            viewport_size,
+            command_buffer,
+            &mut command_encoder,
+        )?;
+
+        command_encoder.end_encoding();
+
+        Ok(())
+    }
+
+    fn frame_pipelines(&self) -> PrimitivePipelines<'_> {
+        PrimitivePipelines {
+            shadows: &self.shadows_pipeline_state,
+            quads: &self.quads_pipeline_state,
+            underlines: &self.underlines_pipeline_state,
+            monochrome_sprites: &self.monochrome_sprites_pipeline_state,
+            polychrome_sprites: &self.polychrome_sprites_pipeline_state,
+        }
+    }
+
+    /// Encodes the batches of `scene` in order with `pipelines`, a retained chunk's own scene included, in its
+    /// place. When this fails, the encoder has ended.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_scene<'a>(
+        &self,
+        scene: &Scene,
+        bindings: &SceneBindings,
+        pipelines: PrimitivePipelines<'_>,
+        writer: &mut InstanceBufferWriter,
+        texture: &'a metal::TextureRef,
+        viewport_size: Size<DevicePixels>,
+        command_buffer: &'a metal::CommandBufferRef,
+        command_encoder: &mut &'a metal::RenderCommandEncoderRef,
+    ) -> Result<()> {
+        let instance_bindings = &bindings.own;
         for batch in scene.batches() {
             match batch {
-                PrimitiveBatch::Shadows(range) => {
-                    self.draw_shadows(range, instance_bindings, viewport_size, command_encoder)
-                }
-                PrimitiveBatch::Quads(range) => {
-                    self.draw_quads(range, instance_bindings, viewport_size, command_encoder)
-                }
+                PrimitiveBatch::Shadows(range) => self.draw_shadows(
+                    pipelines.shadows,
+                    range,
+                    instance_bindings,
+                    viewport_size,
+                    command_encoder,
+                ),
+                PrimitiveBatch::Quads(range) => self.draw_quads(
+                    pipelines.quads,
+                    range,
+                    instance_bindings,
+                    viewport_size,
+                    command_encoder,
+                ),
                 PrimitiveBatch::Paths(range) => {
                     let paths = &scene.paths[range];
                     command_encoder.end_encoding();
@@ -699,7 +793,7 @@ impl MetalRenderer {
                         command_buffer,
                     )?;
 
-                    command_encoder = new_command_encoder_for_texture(
+                    *command_encoder = new_command_encoder_for_texture(
                         command_buffer,
                         texture,
                         viewport_size,
@@ -718,11 +812,16 @@ impl MetalRenderer {
                         }
                     }
                 }
-                PrimitiveBatch::Underlines(range) => {
-                    self.draw_underlines(range, instance_bindings, viewport_size, command_encoder)
-                }
+                PrimitiveBatch::Underlines(range) => self.draw_underlines(
+                    pipelines.underlines,
+                    range,
+                    instance_bindings,
+                    viewport_size,
+                    command_encoder,
+                ),
                 PrimitiveBatch::MonochromeSprites { texture_id, range } => self
                     .draw_monochrome_sprites(
+                        pipelines.monochrome_sprites,
                         texture_id,
                         range,
                         instance_bindings,
@@ -731,6 +830,7 @@ impl MetalRenderer {
                     ),
                 PrimitiveBatch::PolychromeSprites { texture_id, range } => self
                     .draw_polychrome_sprites(
+                        pipelines.polychrome_sprites,
                         texture_id,
                         range,
                         instance_bindings,
@@ -747,12 +847,29 @@ impl MetalRenderer {
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
                 // `draw` flattens the scene, so a group never gets here.
                 PrimitiveBatch::Groups(_) => unreachable!(),
+                PrimitiveBatch::RetainedChunks(range) => {
+                    for index in range {
+                        let chunk = &scene.retained_chunks[index];
+                        match &bindings.chunks[index] {
+                            ChunkBindings::InPlace(chunk_bindings) => self.encode_scene(
+                                &chunk.scene,
+                                chunk_bindings,
+                                pipelines,
+                                writer,
+                                texture,
+                                viewport_size,
+                                command_buffer,
+                                command_encoder,
+                            )?,
+                            ChunkBindings::Layer(layer) => {
+                                self.composite_layer(layer, viewport_size, command_encoder)
+                            }
+                        }
+                    }
+                }
             }
         }
-
-        command_encoder.end_encoding();
-
-        Ok(command_buffer.to_owned())
+        Ok(())
     }
 
     fn draw_paths_to_intermediate(
@@ -827,6 +944,7 @@ impl MetalRenderer {
 
     fn draw_shadows(
         &self,
+        pipeline_state: &metal::RenderPipelineStateRef,
         shadows: Range<usize>,
         instance_bindings: &InstanceBindings,
         viewport_size: Size<DevicePixels>,
@@ -836,7 +954,7 @@ impl MetalRenderer {
             return;
         }
 
-        command_encoder.set_render_pipeline_state(&self.shadows_pipeline_state);
+        command_encoder.set_render_pipeline_state(pipeline_state);
         command_encoder.set_vertex_buffer(
             ShadowInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -869,6 +987,7 @@ impl MetalRenderer {
 
     fn draw_quads(
         &self,
+        pipeline_state: &metal::RenderPipelineStateRef,
         quads: Range<usize>,
         instance_bindings: &InstanceBindings,
         viewport_size: Size<DevicePixels>,
@@ -878,7 +997,7 @@ impl MetalRenderer {
             return;
         }
 
-        command_encoder.set_render_pipeline_state(&self.quads_pipeline_state);
+        command_encoder.set_render_pipeline_state(pipeline_state);
         command_encoder.set_vertex_buffer(
             QuadInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -982,6 +1101,7 @@ impl MetalRenderer {
 
     fn draw_underlines(
         &self,
+        pipeline_state: &metal::RenderPipelineStateRef,
         underlines: Range<usize>,
         instance_bindings: &InstanceBindings,
         viewport_size: Size<DevicePixels>,
@@ -991,7 +1111,7 @@ impl MetalRenderer {
             return;
         }
 
-        command_encoder.set_render_pipeline_state(&self.underlines_pipeline_state);
+        command_encoder.set_render_pipeline_state(pipeline_state);
         command_encoder.set_vertex_buffer(
             UnderlineInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -1024,6 +1144,7 @@ impl MetalRenderer {
 
     fn draw_monochrome_sprites(
         &self,
+        pipeline_state: &metal::RenderPipelineStateRef,
         texture_id: AtlasTextureId,
         sprites: Range<usize>,
         instance_bindings: &InstanceBindings,
@@ -1039,7 +1160,7 @@ impl MetalRenderer {
             DevicePixels(texture.width() as i32),
             DevicePixels(texture.height() as i32),
         );
-        command_encoder.set_render_pipeline_state(&self.monochrome_sprites_pipeline_state);
+        command_encoder.set_render_pipeline_state(pipeline_state);
         command_encoder.set_vertex_buffer(
             SpriteInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -1078,6 +1199,7 @@ impl MetalRenderer {
 
     fn draw_polychrome_sprites(
         &self,
+        pipeline_state: &metal::RenderPipelineStateRef,
         texture_id: AtlasTextureId,
         sprites: Range<usize>,
         instance_bindings: &InstanceBindings,
@@ -1093,7 +1215,7 @@ impl MetalRenderer {
             DevicePixels(texture.width() as i32),
             DevicePixels(texture.height() as i32),
         );
-        command_encoder.set_render_pipeline_state(&self.polychrome_sprites_pipeline_state);
+        command_encoder.set_render_pipeline_state(pipeline_state);
         command_encoder.set_vertex_buffer(
             SpriteInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -1131,7 +1253,7 @@ impl MetalRenderer {
     }
 
     fn draw_surfaces(
-        &mut self,
+        &self,
         surfaces: &[PaintSurface],
         first_surface: usize,
         instance_bindings: &InstanceBindings,
@@ -1289,6 +1411,26 @@ fn build_pipeline_state(
     fragment_fn_name: &str,
     pixel_format: metal::MTLPixelFormat,
 ) -> metal::RenderPipelineState {
+    build_pipeline_state_with_destination_alpha(
+        device,
+        library,
+        label,
+        vertex_fn_name,
+        fragment_fn_name,
+        pixel_format,
+        metal::MTLBlendFactor::One,
+    )
+}
+
+fn build_pipeline_state_with_destination_alpha(
+    device: &metal::DeviceRef,
+    library: &metal::LibraryRef,
+    label: &str,
+    vertex_fn_name: &str,
+    fragment_fn_name: &str,
+    pixel_format: metal::MTLPixelFormat,
+    destination_alpha: metal::MTLBlendFactor,
+) -> metal::RenderPipelineState {
     let vertex_fn = library
         .get_function(vertex_fn_name, None)
         .expect("error locating vertex function");
@@ -1308,7 +1450,7 @@ fn build_pipeline_state(
     color_attachment.set_source_rgb_blend_factor(metal::MTLBlendFactor::SourceAlpha);
     color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);
     color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
-    color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::One);
+    color_attachment.set_destination_alpha_blend_factor(destination_alpha);
 
     device
         .new_render_pipeline_state(&descriptor)

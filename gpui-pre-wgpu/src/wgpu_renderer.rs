@@ -1616,7 +1616,7 @@ impl WgpuRenderer {
                     label: Some("main_encoder"),
                 });
 
-        if scene.groups.iter().any(|group| group.effects.backdrop.is_some()) {
+        if has_backdrop_group(scene) {
             // A group filters what is under it, which is read from its target: the window's texture cannot be.
             // The root scene goes into a surface of its own and the frame is copied from it.
             let root = self.root_view();
@@ -1983,6 +1983,27 @@ impl WgpuRenderer {
         encoder: &mut wgpu::CommandEncoder,
         instance_offset: &mut u64,
     ) -> Result<()> {
+        self.record_scene_with_load(
+            scene,
+            target,
+            depth,
+            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+            encoder,
+            instance_offset,
+        )
+    }
+
+    /// [`Self::record_scene`] with what the first pass does to `target`: a retained chunk's scene is drawn over
+    /// what the target holds.
+    fn record_scene_with_load(
+        &mut self,
+        scene: &Scene,
+        target: &wgpu::TextureView,
+        depth: usize,
+        load: wgpu::LoadOp<wgpu::Color>,
+        encoder: &mut wgpu::CommandEncoder,
+        instance_offset: &mut u64,
+    ) -> Result<()> {
         let instance_bindings = self
             .write_instances(scene, instance_offset)
             .with_context(|| {
@@ -2005,7 +2026,7 @@ impl WgpuRenderer {
                     view: target,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        load,
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
@@ -2016,18 +2037,6 @@ impl WgpuRenderer {
 
             for batch in scene.batches() {
                 match batch {
-                    PrimitiveBatch::Quads(range) => self.draw_instances(
-                        &instance_bindings.quads,
-                        &self.resources().pipelines.quads,
-                        instance_range(range),
-                        &mut pass,
-                    ),
-                    PrimitiveBatch::Shadows(range) => self.draw_instances(
-                        &instance_bindings.shadows,
-                        &self.resources().pipelines.shadows,
-                        instance_range(range),
-                        &mut pass,
-                    ),
                     PrimitiveBatch::Paths(range) => {
                         let paths = &scene.paths[range];
                         if paths.is_empty() {
@@ -2064,40 +2073,6 @@ impl WgpuRenderer {
                             )?;
                         }
                     }
-                    PrimitiveBatch::Underlines(range) => self.draw_instances(
-                        &instance_bindings.underlines,
-                        &self.resources().pipelines.underlines,
-                        instance_range(range),
-                        &mut pass,
-                    ),
-                    PrimitiveBatch::MonochromeSprites { texture_id, range } => self.draw_sprites(
-                        &instance_bindings.monochrome_sprites,
-                        texture_id,
-                        &self.resources().pipelines.mono_sprites,
-                        instance_range(range),
-                        &mut pass,
-                    ),
-                    PrimitiveBatch::SubpixelSprites { texture_id, range } => {
-                        let resources = self.resources();
-                        self.draw_sprites(
-                            &instance_bindings.subpixel_sprites,
-                            texture_id,
-                            resources
-                                .pipelines
-                                .subpixel_sprites
-                                .as_ref()
-                                .unwrap_or(&resources.pipelines.mono_sprites),
-                            instance_range(range),
-                            &mut pass,
-                        );
-                    }
-                    PrimitiveBatch::PolychromeSprites { texture_id, range } => self.draw_sprites(
-                        &instance_bindings.polychrome_sprites,
-                        texture_id,
-                        &self.resources().pipelines.poly_sprites,
-                        instance_range(range),
-                        &mut pass,
-                    ),
                     PrimitiveBatch::Groups(range) => {
                         drop(pass);
                         for group in &scene.groups[range] {
@@ -2118,14 +2093,128 @@ impl WgpuRenderer {
                             ..Default::default()
                         });
                     }
-                    // Surfaces are macOS-only for video playback and are not
-                    // implemented by the WGPU renderer.
-                    PrimitiveBatch::Surfaces(_surfaces) => {}
+                    PrimitiveBatch::RetainedChunks(range) => {
+                        for chunk in &scene.retained_chunks[range] {
+                            if fits_in_one_pass(&chunk.scene) {
+                                self.record_scene_in_pass(&chunk.scene, instance_offset, &mut pass)?;
+                            } else {
+                                drop(pass);
+                                self.record_scene_with_load(
+                                    &chunk.scene,
+                                    target,
+                                    depth,
+                                    wgpu::LoadOp::Load,
+                                    encoder,
+                                    instance_offset,
+                                )?;
+                                pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                    label: Some("main_pass_continued"),
+                                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                        view: target,
+                                        resolve_target: None,
+                                        ops: wgpu::Operations {
+                                            load: wgpu::LoadOp::Load,
+                                            store: wgpu::StoreOp::Store,
+                                        },
+                                        depth_slice: None,
+                                    })],
+                                    depth_stencil_attachment: None,
+                                    ..Default::default()
+                                });
+                            }
+                        }
+                    }
+                    batch => self.draw_batch_in_pass(batch, &instance_bindings, &mut pass),
                 }
             }
         }
 
         Ok(())
+    }
+
+    /// Draws a scene that [`fits_in_one_pass`] in the pass it is given: a retained chunk drawn in place.
+    fn record_scene_in_pass(
+        &mut self,
+        scene: &Scene,
+        instance_offset: &mut u64,
+        pass: &mut wgpu::RenderPass<'_>,
+    ) -> Result<()> {
+        let instance_bindings = self.write_instances(scene, instance_offset)?;
+        for batch in scene.batches() {
+            match batch {
+                PrimitiveBatch::RetainedChunks(range) => {
+                    for chunk in &scene.retained_chunks[range] {
+                        self.record_scene_in_pass(&chunk.scene, instance_offset, pass)?;
+                    }
+                }
+                batch => self.draw_batch_in_pass(batch, &instance_bindings, pass),
+            }
+        }
+        Ok(())
+    }
+
+    /// Draws a batch that needs nothing but its instances and the pass. Paths, groups and retained chunks need
+    /// the encoder, and their callers draw them.
+    fn draw_batch_in_pass(
+        &self,
+        batch: PrimitiveBatch,
+        instance_bindings: &InstanceBindings,
+        pass: &mut wgpu::RenderPass<'_>,
+    ) {
+        match batch {
+            PrimitiveBatch::Quads(range) => self.draw_instances(
+                &instance_bindings.quads,
+                &self.resources().pipelines.quads,
+                instance_range(range),
+                pass,
+            ),
+            PrimitiveBatch::Shadows(range) => self.draw_instances(
+                &instance_bindings.shadows,
+                &self.resources().pipelines.shadows,
+                instance_range(range),
+                pass,
+            ),
+            PrimitiveBatch::Underlines(range) => self.draw_instances(
+                &instance_bindings.underlines,
+                &self.resources().pipelines.underlines,
+                instance_range(range),
+                pass,
+            ),
+            PrimitiveBatch::MonochromeSprites { texture_id, range } => self.draw_sprites(
+                &instance_bindings.monochrome_sprites,
+                texture_id,
+                &self.resources().pipelines.mono_sprites,
+                instance_range(range),
+                pass,
+            ),
+            PrimitiveBatch::SubpixelSprites { texture_id, range } => {
+                let resources = self.resources();
+                self.draw_sprites(
+                    &instance_bindings.subpixel_sprites,
+                    texture_id,
+                    resources
+                        .pipelines
+                        .subpixel_sprites
+                        .as_ref()
+                        .unwrap_or(&resources.pipelines.mono_sprites),
+                    instance_range(range),
+                    pass,
+                );
+            }
+            PrimitiveBatch::PolychromeSprites { texture_id, range } => self.draw_sprites(
+                &instance_bindings.polychrome_sprites,
+                texture_id,
+                &self.resources().pipelines.poly_sprites,
+                instance_range(range),
+                pass,
+            ),
+            // Surfaces are macOS-only for video playback and are not
+            // implemented by the WGPU renderer.
+            PrimitiveBatch::Surfaces(_surfaces) => {}
+            PrimitiveBatch::Paths(_)
+            | PrimitiveBatch::Groups(_)
+            | PrimitiveBatch::RetainedChunks(_) => {}
+        }
     }
 
     fn write_instances(
@@ -2724,6 +2813,29 @@ impl WgpuRenderer {
 
 fn instance_range(range: Range<usize>) -> Range<u32> {
     range.start as u32..range.end as u32
+}
+
+/// Whether nothing of the scene, its retained chunks included, ends the pass it is drawn in: a path is rasterized
+/// in a pass of its own, and a group is painted into a surface of its own.
+fn fits_in_one_pass(scene: &Scene) -> bool {
+    scene.paths.is_empty()
+        && scene.groups.is_empty()
+        && scene
+            .retained_chunks
+            .iter()
+            .all(|chunk| fits_in_one_pass(&chunk.scene))
+}
+
+/// Whether a group of the scene, or of a retained chunk drawn in place on it, filters what is under it.
+fn has_backdrop_group(scene: &Scene) -> bool {
+    scene
+        .groups
+        .iter()
+        .any(|group| group.effects.backdrop.is_some())
+        || scene
+            .retained_chunks
+            .iter()
+            .any(|chunk| has_backdrop_group(&chunk.scene))
 }
 
 #[cfg(not(target_family = "wasm"))]

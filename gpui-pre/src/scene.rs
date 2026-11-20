@@ -53,6 +53,28 @@ pub struct Scene {
     pub surfaces: Vec<PaintSurface>,
     /// Content painted apart and put on the scene as one: see [`Group`].
     pub groups: Vec<Group>,
+    /// Content of cached views, each put on the scene as one: see [`RetainedChunk`].
+    pub retained_chunks: Vec<RetainedChunk>,
+    covered: Option<Bounds<ScaledPixels>>,
+}
+
+/// What a cached view painted, kept from the frame it painted in and put on its parent's scene as one entry, so
+/// a frame where the view is clean neither copies nor sorts the view's primitives again. A renderer draws `scene` at
+/// `order`, or draws a copy it keeps under `layer_id` for as long as `generation` stays the same.
+#[derive(Clone)]
+#[expect(missing_docs)]
+pub struct RetainedChunk {
+    pub order: DrawOrder,
+    /// What the content covers, cut to its content masks.
+    pub bounds: Bounds<ScaledPixels>,
+    /// The cached view: one id for its whole life.
+    pub layer_id: u64,
+    /// Rises each time the view paints again.
+    pub generation: u64,
+    /// Frames in a row the view has been put on the scene without painting again.
+    pub clean_frames: u32,
+    /// The content, finished.
+    pub scene: Arc<Scene>,
 }
 
 /// What a [`Group`] does to its content when it is put on the scene.
@@ -214,6 +236,66 @@ impl Scene {
         self.polychrome_sprites.clear();
         self.surfaces.clear();
         self.groups.clear();
+        self.retained_chunks.clear();
+        self.covered = None;
+    }
+
+    /// The union of the clipped bounds of everything on the scene, `None` while it is empty.
+    pub fn covered_bounds(&self) -> Option<Bounds<ScaledPixels>> {
+        self.covered
+    }
+
+    fn cover(&mut self, bounds: Bounds<ScaledPixels>) {
+        self.covered = Some(match self.covered {
+            Some(covered) => covered.union(&bounds),
+            None => bounds,
+        });
+    }
+
+    /// Primitives on the scene, with those of its retained chunks counted as if they were on it.
+    pub fn total_primitive_count(&self) -> usize {
+        self.quads.len()
+            + self.shadows.len()
+            + self.paths.len()
+            + self.underlines.len()
+            + self.monochrome_sprites.len()
+            + self.subpixel_sprites.len()
+            + self.polychrome_sprites.len()
+            + self
+                .retained_chunks
+                .iter()
+                .map(|chunk| chunk.scene.total_primitive_count())
+                .sum::<usize>()
+    }
+
+    /// Whether moving every primitive by whole device pixels, to draw the scene into a target of its own, moves
+    /// its pixels and changes none of them. Paths, surfaces, groups, subpixel and transformed sprites, and the
+    /// dither of a linear gradient are drawn through the window's own coordinates, so a scene with any is not.
+    pub fn is_translation_invariant(&self) -> bool {
+        self.paths.is_empty()
+            && self.surfaces.is_empty()
+            && self.groups.is_empty()
+            && self.subpixel_sprites.is_empty()
+            && self
+                .quads
+                .iter()
+                .all(|quad| quad.background.tag != crate::color::BackgroundTag::LinearGradient)
+            && self
+                .monochrome_sprites
+                .iter()
+                .all(|sprite| sprite.transformation == TransformationMatrix::unit())
+            && self
+                .retained_chunks
+                .iter()
+                .all(|chunk| chunk.scene.is_translation_invariant())
+    }
+
+    fn has_groups(&self) -> bool {
+        !self.groups.is_empty()
+            || self
+                .retained_chunks
+                .iter()
+                .any(|chunk| chunk.scene.has_groups())
     }
 
     pub fn len(&self) -> usize {
@@ -241,6 +323,7 @@ impl Scene {
         if clipped_bounds.is_empty() {
             return;
         }
+        self.cover(clipped_bounds);
 
         let order = self
             .layer_stack
@@ -307,6 +390,7 @@ impl Scene {
         let Some(area) = area else {
             return;
         };
+        self.cover(area);
         let order = self
             .layer_stack
             .last()
@@ -326,6 +410,7 @@ impl Scene {
         if clipped_bounds.is_empty() {
             return;
         }
+        self.cover(clipped_bounds);
         group.order = self
             .layer_stack
             .last()
@@ -335,10 +420,27 @@ impl Scene {
         self.paint_operations.push(PaintOperation::Group(group));
     }
 
+    /// Puts a cached view's content on the scene. The chunk's scene must be finished.
+    ///
+    /// Inside a layer, where everything has one order, the content goes on primitive by primitive: as one chunk it
+    /// would be drawn after every other primitive of the layer, whatever was painted first.
+    pub fn insert_retained_chunk(&mut self, mut chunk: RetainedChunk) {
+        if !self.layer_stack.is_empty() {
+            self.replay(0..chunk.scene.len(), &chunk.scene);
+            return;
+        }
+        self.cover(chunk.bounds);
+        chunk.order = self.primitive_bounds.insert(chunk.bounds);
+        self.retained_chunks.push(chunk.clone());
+        self.paint_operations
+            .push(PaintOperation::RetainedChunk(chunk));
+    }
+
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
         for operation in &prev_scene.paint_operations[range] {
             match operation {
                 PaintOperation::Group(group) => self.insert_group(group.clone()),
+                PaintOperation::RetainedChunk(chunk) => self.insert_retained_chunk(chunk.clone()),
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
                 PaintOperation::MonochromeRun(run) => self.insert_monochrome_run(run.clone()),
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
@@ -351,7 +453,7 @@ impl Scene {
     /// renderer that cannot composite a group. Two shapes of a group that overlap show through each other where a
     /// group would show one surface, and a colour matrix is left out. `None` when the scene has no group.
     pub fn flattened(&self) -> Option<Scene> {
-        if self.groups.is_empty() {
+        if !self.has_groups() {
             return None;
         }
         let mut flat = Scene::default();
@@ -380,6 +482,7 @@ impl Scene {
                 PaintOperation::Group(group) => {
                     self.replay_flat(&group.scene, opacity * group.effects.opacity);
                 }
+                PaintOperation::RetainedChunk(chunk) => self.replay_flat(&chunk.scene, opacity),
             }
         }
     }
@@ -397,6 +500,7 @@ impl Scene {
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.surfaces.sort_by_key(|surface| surface.order);
         self.groups.sort_by_key(|group| group.order);
+        self.retained_chunks.sort_by_key(|chunk| chunk.order);
     }
 
     #[cfg_attr(
@@ -426,6 +530,8 @@ impl Scene {
             surfaces_iter: self.surfaces.iter().peekable(),
             groups_start: 0,
             groups_iter: self.groups.iter().peekable(),
+            retained_chunks_start: 0,
+            retained_chunks_iter: self.retained_chunks.iter().peekable(),
         }
     }
 }
@@ -449,12 +555,14 @@ pub(crate) enum PrimitiveKind {
     PolychromeSprite,
     Surface,
     Group,
+    RetainedChunk,
 }
 
 pub(crate) enum PaintOperation {
     Primitive(Primitive),
     MonochromeRun(Vec<MonochromeSprite>),
     Group(Group),
+    RetainedChunk(RetainedChunk),
     StartLayer(Bounds<ScaledPixels>),
     EndLayer,
 }
@@ -549,6 +657,8 @@ struct BatchIterator<'a> {
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
     groups_start: usize,
     groups_iter: Peekable<slice::Iter<'a, Group>>,
+    retained_chunks_start: usize,
+    retained_chunks_iter: Peekable<slice::Iter<'a, RetainedChunk>>,
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
@@ -585,6 +695,10 @@ impl<'a> Iterator for BatchIterator<'a> {
             (
                 self.groups_iter.peek().map(|g| g.order),
                 PrimitiveKind::Group,
+            ),
+            (
+                self.retained_chunks_iter.peek().map(|c| c.order),
+                PrimitiveKind::RetainedChunk,
             ),
         ];
         orders_and_kinds.sort_by_key(|(order, kind)| (order.unwrap_or(u32::MAX), *kind));
@@ -745,6 +859,20 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.groups_start = groups_end;
                 Some(PrimitiveBatch::Groups(groups_start..groups_end))
             }
+            PrimitiveKind::RetainedChunk => {
+                let chunks_start = self.retained_chunks_start;
+                let mut chunks_end = chunks_start + 1;
+                self.retained_chunks_iter.next();
+                while self
+                    .retained_chunks_iter
+                    .next_if(|chunk| (chunk.order, batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    chunks_end += 1;
+                }
+                self.retained_chunks_start = chunks_end;
+                Some(PrimitiveBatch::RetainedChunks(chunks_start..chunks_end))
+            }
         }
     }
 }
@@ -779,6 +907,8 @@ pub enum PrimitiveBatch {
     Surfaces(Range<usize>),
     /// Groups of one order, in `Scene::groups`: each is painted apart and composited.
     Groups(Range<usize>),
+    /// Retained chunks of one order, in `Scene::retained_chunks`: each one's scene is drawn whole, in turn.
+    RetainedChunks(Range<usize>),
 }
 
 impl PrimitiveBatch {
@@ -812,6 +942,7 @@ impl PrimitiveBatch {
             }
             Self::Surfaces(range) => format!("surfaces ({})", range.len()),
             Self::Groups(range) => format!("groups ({})", range.len()),
+            Self::RetainedChunks(range) => format!("retained chunks ({})", range.len()),
         }
     }
 }
