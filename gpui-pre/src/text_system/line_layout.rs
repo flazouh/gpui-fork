@@ -492,6 +492,18 @@ pub(crate) struct LineLayoutIndex {
     wrapped_lines_by_hash_index: usize,
 }
 
+// A frame that clears the cache for a new font generation leaves an index before one taken earlier in it.
+crate::window::impl_frame_index!(LineLayoutIndex {
+    counts: [
+        lines_index,
+        wrapped_lines_index,
+        lines_by_hash_index,
+        wrapped_lines_by_hash_index,
+    ],
+    indices: [],
+    kept: [font_generation],
+});
+
 impl LineLayoutCache {
     pub fn new(
         platform_text_system: Arc<dyn PlatformTextSystem>,
@@ -562,6 +574,36 @@ impl LineLayoutCache {
             }
             current_frame.used_wrapped_lines_by_hash.push(key.clone());
         }
+    }
+
+    /// Whether [`Self::reuse_layouts`] can take `range` from the frame before: it is in order and within what that
+    /// frame used. A range of another font generation holds, since nothing of it is taken.
+    pub fn holds_layouts(&self, range: &Range<LineLayoutIndex>) -> bool {
+        let font_generation = self.clear_if_font_generation_changed();
+        if range.start.font_generation != font_generation
+            || range.end.font_generation != font_generation
+        {
+            return true;
+        }
+        let previous_frame = self.previous_frame.lock();
+        let within = |start: usize, end: usize, len: usize| start <= end && end <= len;
+        within(
+            range.start.lines_index,
+            range.end.lines_index,
+            previous_frame.used_lines.len(),
+        ) && within(
+            range.start.wrapped_lines_index,
+            range.end.wrapped_lines_index,
+            previous_frame.used_wrapped_lines.len(),
+        ) && within(
+            range.start.lines_by_hash_index,
+            range.end.lines_by_hash_index,
+            previous_frame.used_lines_by_hash.len(),
+        ) && within(
+            range.start.wrapped_lines_by_hash_index,
+            range.end.wrapped_lines_by_hash_index,
+            previous_frame.used_wrapped_lines_by_hash.len(),
+        )
     }
 
     pub fn truncate_layouts(&self, index: LineLayoutIndex) {

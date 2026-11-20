@@ -269,34 +269,10 @@ impl DispatchTree {
     ) -> ReusedSubtree {
         let new_range = self.nodes.len()..self.nodes.len() + old_range.len();
 
-        let mut contains_focus = false;
-        let mut source_stack = vec![];
-        for (source_node_id, source_node) in source
-            .nodes
-            .iter_mut()
-            .enumerate()
-            .skip(old_range.start)
-            .take(old_range.len())
-        {
-            let source_node_id = DispatchNodeId(source_node_id);
-            while let Some(source_ancestor) = source_stack.last() {
-                if source_node.parent == Some(*source_ancestor) {
-                    break;
-                } else {
-                    source_stack.pop();
-                    self.pop_node();
-                }
-            }
-
-            source_stack.push(source_node_id);
-            if source_node.focus_id.is_some() && source_node.focus_id == focus {
-                contains_focus = true;
-            }
-            self.move_node(source_node);
-        }
-
-        while !source_stack.is_empty() {
-            source_stack.pop();
+        let mut open_nodes = Vec::new();
+        let contains_focus =
+            self.reuse_nodes_open(old_range.clone(), source, focus, &mut open_nodes);
+        for _ in open_nodes {
             self.pop_node();
         }
 
@@ -305,6 +281,39 @@ impl DispatchTree {
             new_range,
             contains_focus,
         }
+    }
+
+    /// The nodes still open at the end stay pushed, and on `open_nodes` by their ids in `source`, so that another
+    /// run goes on from where this one stopped. Returns whether a moved node has the focus.
+    pub fn reuse_nodes_open(
+        &mut self,
+        old_range: Range<usize>,
+        source: &mut Self,
+        focus: Option<FocusId>,
+        open_nodes: &mut Vec<DispatchNodeId>,
+    ) -> bool {
+        let mut contains_focus = false;
+        for (source_node_id, source_node) in source
+            .nodes
+            .iter_mut()
+            .enumerate()
+            .skip(old_range.start)
+            .take(old_range.len())
+        {
+            while let Some(source_ancestor) = open_nodes.last() {
+                if source_node.parent == Some(*source_ancestor) {
+                    break;
+                }
+                open_nodes.pop();
+                self.pop_node();
+            }
+            open_nodes.push(DispatchNodeId(source_node_id));
+            if source_node.focus_id.is_some() && source_node.focus_id == focus {
+                contains_focus = true;
+            }
+            self.move_node(source_node);
+        }
+        contains_focus
     }
 
     pub fn truncate(&mut self, index: usize) {

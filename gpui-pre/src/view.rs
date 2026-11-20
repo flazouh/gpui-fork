@@ -1,18 +1,15 @@
+use crate::retained_view::{self, ViewPrepaint};
 use crate::{
-    AnyElement, AnyEntity, AnyWeakEntity, App, AvailableSpace, Bounds, ContentMask, Context,
-    Element, ElementId, Entity, EntityId, GlobalElementId, InspectorElementId, IntoElement,
-    LayoutId, PaintIndex, Pixels, PrepaintStateIndex, Render, RenderOnce, Size, Style,
-    StyleRefinement, TextStyle, WeakEntity,
+    AnyElement, AnyEntity, AnyWeakEntity, App, Bounds, Context, Element, ElementId, Entity,
+    EntityId, GlobalElementId, InspectorElementId, IntoElement, LayoutId, Pixels, Render,
+    RenderOnce, Style, StyleRefinement, WeakEntity,
 };
 use crate::{Empty, Window};
 use anyhow::Result;
-use collections::FxHashSet;
 use refineable::Refineable;
-use std::mem;
 use std::{
     any::{TypeId, type_name},
     fmt,
-    ops::Range,
 };
 
 /// A dynamically-typed view handle that can be downcast to a specific `Entity<V>`.
@@ -74,6 +71,10 @@ impl AnyView {
     pub fn entity_id(&self) -> EntityId {
         self.entity.entity_id()
     }
+
+    pub(crate) fn render_element(&self, window: &mut Window, cx: &mut App) -> AnyElement {
+        (self.render)(self, window, cx)
+    }
 }
 
 impl PartialEq for AnyView {
@@ -94,6 +95,10 @@ impl View for AnyView {
 
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         (self.render)(&self, window, cx)
+    }
+
+    fn render_handle(&self) -> Option<AnyWeakView> {
+        Some(self.downgrade())
     }
 }
 
@@ -119,6 +124,7 @@ impl IntoElement for AnyView {
 }
 
 /// A weak, dynamically-typed view handle.
+#[derive(Clone)]
 pub struct AnyWeakView {
     entity: AnyWeakEntity,
     render: fn(&AnyView, &mut Window, &mut App) -> AnyElement,
@@ -202,6 +208,14 @@ pub trait View: 'static + Sized {
 
     /// Render this view into an element tree, consuming `self`.
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement;
+
+    /// A handle that renders this view again later, with what [`View::render`] would give. A cached view that
+    /// holds this one cached needs it to draw again around this view without rendering itself. With `None`, the
+    /// default, that view renders whenever this one changes.
+    #[doc(hidden)]
+    fn render_handle(&self) -> Option<AnyWeakView> {
+        None
+    }
 }
 
 /// A stateless component (`RenderOnce`) is a `View` with no identity.
@@ -227,6 +241,10 @@ impl<T: Render> View for Entity<T> {
         self.update(cx, |this, cx| {
             Render::render(this, window, cx).into_any_element()
         })
+    }
+
+    fn render_handle(&self) -> Option<AnyWeakView> {
+        Some(self.downgrade().into())
     }
 }
 
@@ -292,22 +310,9 @@ impl<V: View> IntoElement for ViewElement<V> {
     }
 }
 
-struct ViewElementState {
-    prepaint_range: Range<PrepaintStateIndex>,
-    paint_range: Range<PaintIndex>,
-    cache_key: ViewElementCacheKey,
-    accessed_entities: FxHashSet<EntityId>,
-}
-
-struct ViewElementCacheKey {
-    bounds: Bounds<Pixels>,
-    content_mask: ContentMask<Pixels>,
-    text_style: TextStyle,
-}
-
 impl<V: View> Element for ViewElement<V> {
     type RequestLayoutState = Option<AnyElement>;
-    type PrepaintState = Option<AnyElement>;
+    type PrepaintState = ViewPrepaint;
 
     fn id(&self) -> Option<ElementId> {
         self.entity_id.map(ElementId::View)
@@ -358,7 +363,7 @@ impl<V: View> Element for ViewElement<V> {
         element: &mut Self::RequestLayoutState,
         window: &mut Window,
         cx: &mut App,
-    ) -> Option<AnyElement> {
+    ) -> ViewPrepaint {
         if let Some(entity_id) = self.entity_id {
             // Stateful path.
             prepaint_view(
@@ -369,11 +374,9 @@ impl<V: View> Element for ViewElement<V> {
                 window,
                 cx,
                 &mut |window, cx| {
-                    self.view
-                        .take()
-                        .unwrap()
-                        .render(window, cx)
-                        .into_any_element()
+                    let view = self.view.take().unwrap();
+                    let render_handle = view.render_handle();
+                    (view.render(window, cx).into_any_element(), render_handle)
                 },
             )
         } else {
@@ -459,72 +462,23 @@ fn request_layout_component(
 }
 
 #[inline(never)]
-fn prepaint_view(
+pub(crate) fn prepaint_view(
     entity_id: EntityId,
     global_id: Option<&GlobalElementId>,
     bounds: Bounds<Pixels>,
     element: &mut Option<AnyElement>,
     window: &mut Window,
     cx: &mut App,
-    render: &mut dyn FnMut(&mut Window, &mut App) -> AnyElement,
-) -> Option<AnyElement> {
+    render: &mut dyn FnMut(&mut Window, &mut App) -> (AnyElement, Option<AnyWeakView>),
+) -> ViewPrepaint {
     window.set_view_id(entity_id);
     window.with_rendered_view(entity_id, |window| {
         if let Some(mut element) = element.take() {
             element.prepaint(window, cx);
-            return Some(element);
+            return ViewPrepaint::rendered(element);
         }
 
-        window.with_element_state::<ViewElementState, _>(
-            global_id.unwrap(),
-            |element_state, window| {
-                let content_mask = window.content_mask();
-                let text_style = window.text_style();
-
-                if let Some(mut element_state) = element_state
-                    && element_state.cache_key.bounds == bounds
-                    && element_state.cache_key.content_mask == content_mask
-                    && element_state.cache_key.text_style == text_style
-                    && !window.dirty_views.contains(&entity_id)
-                    && !window.refreshing
-                {
-                    let prepaint_start = window.prepaint_index();
-                    window.reuse_prepaint(element_state.prepaint_range.clone());
-                    cx.entities
-                        .extend_accessed(&element_state.accessed_entities);
-                    let prepaint_end = window.prepaint_index();
-                    element_state.prepaint_range = prepaint_start..prepaint_end;
-
-                    return (None, element_state);
-                }
-
-                let refreshing = mem::replace(&mut window.refreshing, true);
-                let prepaint_start = window.prepaint_index();
-                let (element, accessed_entities) = cx.detect_accessed_entities(|cx| {
-                    let mut element = render(window, cx);
-                    element.layout_as_root(Size::<AvailableSpace>::from(bounds.size), window, cx);
-                    element.prepaint_at(bounds.origin, window, cx);
-                    element
-                });
-
-                let prepaint_end = window.prepaint_index();
-                window.refreshing = refreshing;
-
-                (
-                    Some(element),
-                    ViewElementState {
-                        accessed_entities,
-                        prepaint_range: prepaint_start..prepaint_end,
-                        paint_range: PaintIndex::default()..PaintIndex::default(),
-                        cache_key: ViewElementCacheKey {
-                            bounds,
-                            content_mask,
-                            text_style,
-                        },
-                    },
-                )
-            },
-        )
+        retained_view::prepaint(entity_id, global_id.unwrap(), bounds, window, cx, render)
     })
 }
 
@@ -534,48 +488,28 @@ fn prepaint_component(
     element: &mut Option<AnyElement>,
     window: &mut Window,
     cx: &mut App,
-) -> Option<AnyElement> {
+) -> ViewPrepaint {
     window.with_id(ElementId::from(name), |window| {
         element.as_mut().unwrap().prepaint(window, cx);
     });
-    Some(element.take().unwrap())
+    ViewPrepaint::rendered(element.take().unwrap())
 }
 
 #[inline(never)]
-fn paint_view(
+pub(crate) fn paint_view(
     entity_id: EntityId,
     cached: bool,
     global_id: Option<&GlobalElementId>,
-    element: &mut Option<AnyElement>,
+    prepaint: &mut ViewPrepaint,
     window: &mut Window,
     cx: &mut App,
 ) {
     window.with_rendered_view(entity_id, |window| {
         let caching_disabled = window.is_inspector_picking(cx);
         if cached && !caching_disabled {
-            window.with_element_state::<ViewElementState, _>(
-                global_id.unwrap(),
-                |element_state, window| {
-                    let mut element_state = element_state.unwrap();
-
-                    let paint_start = window.paint_index();
-
-                    if let Some(element) = element {
-                        let refreshing = mem::replace(&mut window.refreshing, true);
-                        element.paint(window, cx);
-                        window.refreshing = refreshing;
-                    } else {
-                        window.reuse_paint(element_state.paint_range.clone());
-                    }
-
-                    let paint_end = window.paint_index();
-                    element_state.paint_range = paint_start..paint_end;
-
-                    ((), element_state)
-                },
-            )
-        } else {
-            element.as_mut().unwrap().paint(window, cx);
+            retained_view::paint(entity_id, global_id.unwrap(), prepaint, window, cx);
+        } else if let Some(element) = prepaint.rendered_element() {
+            element.paint(window, cx);
         }
     });
 }
@@ -583,11 +517,13 @@ fn paint_view(
 #[inline(never)]
 fn paint_component(
     name: &'static str,
-    element: &mut Option<AnyElement>,
+    prepaint: &mut ViewPrepaint,
     window: &mut Window,
     cx: &mut App,
 ) {
     window.with_id(ElementId::Name(name.into()), |window| {
-        element.as_mut().unwrap().paint(window, cx);
+        if let Some(element) = prepaint.rendered_element() {
+            element.paint(window, cx);
+        }
     });
 }

@@ -46,6 +46,7 @@ pub mod profiler;
 ))]
 #[expect(missing_docs)]
 pub mod queue;
+mod retained_view;
 mod scene;
 mod shared_uri;
 mod spring;
@@ -147,6 +148,7 @@ pub use profiler::*;
 #[cfg(any(target_os = "windows", target_os = "linux", target_family = "wasm"))]
 pub use queue::{PriorityQueueReceiver, PriorityQueueSender};
 pub use refineable::*;
+pub use retained_view::ViewPrepaint;
 pub use scene::*;
 pub use shared_uri::*;
 use std::{any::Any, future::Future};

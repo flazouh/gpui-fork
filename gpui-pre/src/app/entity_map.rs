@@ -56,6 +56,7 @@ impl Display for EntityId {
 pub(crate) struct EntityMap {
     entities: SecondaryMap<EntityId, Box<dyn Any>>,
     pub accessed_entities: RefCell<FxHashSet<EntityId>>,
+    read_scope: RefCell<Option<FxHashSet<EntityId>>>,
     ref_counts: Arc<RwLock<EntityRefCounts>>,
 }
 
@@ -76,6 +77,7 @@ impl EntityMap {
         Self {
             entities: SecondaryMap::new(),
             accessed_entities: RefCell::new(FxHashSet::default()),
+            read_scope: RefCell::new(None),
             ref_counts: Arc::new(RwLock::new(EntityRefCounts {
                 counts: SlotMap::with_key(),
                 dropped_entity_ids: Vec::new(),
@@ -187,6 +189,13 @@ impl EntityMap {
         self.accessed_entities.get_mut().clear();
     }
 
+    pub fn swap_read_scope(
+        &mut self,
+        outer: Option<FxHashSet<EntityId>>,
+    ) -> Option<FxHashSet<EntityId>> {
+        std::mem::replace(self.read_scope.get_mut(), outer)
+    }
+
     pub fn take_dropped(&mut self) -> Vec<(EntityId, Box<dyn Any>)> {
         let mut ref_counts = &mut *self.ref_counts.write();
         let dropped_entity_ids = ref_counts.dropped_entity_ids.drain(..);
@@ -212,12 +221,18 @@ impl EntityMap {
     fn read_inner(&self, entity_id: EntityId) -> Option<&dyn Any> {
         let mut accessed_entities = self.accessed_entities.borrow_mut();
         accessed_entities.insert(entity_id);
+        if let Some(read_scope) = self.read_scope.borrow_mut().as_mut() {
+            read_scope.insert(entity_id);
+        }
         self.entities.get(entity_id).map(Box::as_ref)
     }
 
     #[inline(never)]
     fn lease_inner(&mut self, entity_id: EntityId) -> Option<Box<dyn Any>> {
         self.accessed_entities.get_mut().insert(entity_id);
+        if let Some(read_scope) = self.read_scope.get_mut() {
+            read_scope.insert(entity_id);
+        }
         self.entities.remove(entity_id)
     }
 
