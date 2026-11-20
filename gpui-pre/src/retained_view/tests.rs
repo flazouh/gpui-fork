@@ -1,8 +1,8 @@
 use crate::{
     self as gpui, AnyView, App, AppContext as _, AvailableSpace, Bounds, Context, Entity, EntityId,
     FocusHandle, InteractiveElement, IntoElement, Modifiers, PaintOperation, ParentElement, Pixels,
-    Primitive, Render, Scene, StatefulInteractiveElement, StyleRefinement, Styled, TestAppContext,
-    View, ViewElement, VisualTestContext, Window, canvas, div, fill, point,
+    Primitive, Render, ScaledPixels, Scene, Size, StatefulInteractiveElement, StyleRefinement,
+    Styled, TestAppContext, View, ViewElement, VisualTestContext, Window, canvas, div, fill, point,
     prelude::FluentBuilder as _, px, rems, rgb, size,
 };
 use std::{
@@ -670,6 +670,18 @@ fn a_cached_view_paints_with_the_opacity_around_it_when_that_changes(cx: &mut Te
     );
 }
 
+fn retained_quad_sizes(cx: &mut VisualTestContext) -> Vec<Size<ScaledPixels>> {
+    cx.update(|window, _| {
+        window
+            .rendered_frame
+            .scene
+            .retained_chunks
+            .iter()
+            .flat_map(|chunk| chunk.scene.quads.iter().map(|quad| quad.bounds.size))
+            .collect()
+    })
+}
+
 struct RemBox {
     renders: usize,
 }
@@ -702,17 +714,6 @@ fn a_cached_view_lays_out_again_when_the_rem_size_changes(cx: &mut TestAppContex
     });
     let mut cx = VisualTestContext::from_window(window.into(), cx);
     cx.run_until_parked();
-    let retained_quad_sizes = |cx: &mut VisualTestContext| {
-        cx.update(|window, _| {
-            window
-                .rendered_frame
-                .scene
-                .retained_chunks
-                .iter()
-                .flat_map(|chunk| chunk.scene.quads.iter().map(|quad| quad.bounds.size))
-                .collect::<Vec<_>>()
-        })
-    };
     let scale = cx.update(|window, _| window.scale_factor());
     let scaled = |width: f32, height: f32| size(px(width).scale(scale), px(height).scale(scale));
     assert_eq!(retained_quad_sizes(&mut cx), [scaled(32., 16.)]);
@@ -745,11 +746,77 @@ fn a_cached_view_shown_again_after_frames_it_was_hidden_in_takes_clicks(cx: &mut
         [1.; ROW_COUNT],
         "the pane shows in the first frame it is visible in"
     );
-    h.cx.update(|window, cx| window.simulate_next_frame(cx));
-    h.cx.run_until_parked();
+    assert_eq!(h.frame_requests(), 0, "that frame is whole");
     h.click_row(4);
     h.click_header();
     assert_eq!(h.clicks(), ["row4", "header"]);
+}
+
+struct Bar {
+    width: f32,
+}
+
+impl Render for Bar {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().w(px(self.width)).h(px(10.)).bg(rgb(0xff0000))
+    }
+}
+
+struct BarRoot {
+    bar: Entity<Bar>,
+    hidden: bool,
+}
+
+impl Render for BarRoot {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(
+            div().when(self.hidden, |bar| bar.invisible()).child(
+                self.bar
+                    .clone()
+                    .cached(StyleRefinement::default().w(px(100.)).h(px(100.))),
+            ),
+        )
+    }
+}
+
+#[gpui::test]
+fn a_cached_view_that_rendered_while_hidden_shows_what_it_rendered_last(cx: &mut TestAppContext) {
+    let window = cx.open_window(size(px(400.), px(400.)), |_, cx| BarRoot {
+        bar: cx.new(|_| Bar { width: 10. }),
+        hidden: false,
+    });
+    let root = window.root(cx).unwrap();
+    let mut cx = VisualTestContext::from_window(window.into(), cx);
+    cx.run_until_parked();
+    let scale = cx.update(|window, _| window.scale_factor());
+    let scaled = |width: f32| size(px(width).scale(scale), px(10.).scale(scale));
+    assert_eq!(retained_quad_sizes(&mut cx), [scaled(10.)]);
+
+    let set_hidden = |hidden: bool, cx: &mut VisualTestContext| {
+        cx.update(|_, cx| {
+            root.update(cx, |root, cx| {
+                root.hidden = hidden;
+                cx.notify();
+            })
+        });
+        cx.run_until_parked();
+    };
+    set_hidden(true, &mut cx);
+    assert!(retained_quad_sizes(&mut cx).is_empty());
+    cx.update(|_, cx| {
+        root.read(cx).bar.clone().update(cx, |bar, cx| {
+            bar.width = 30.;
+            cx.notify();
+        })
+    });
+    cx.run_until_parked();
+
+    set_hidden(false, &mut cx);
+    assert_eq!(
+        retained_quad_sizes(&mut cx),
+        [scaled(30.)],
+        "the first frame the bar is visible in shows its new width"
+    );
 }
 
 struct Box {

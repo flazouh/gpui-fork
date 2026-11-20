@@ -39,11 +39,7 @@ pub struct ViewPrepaint(Outcome);
 
 enum Outcome {
     Rendered(AnyElement),
-    /// `paint` is where the view's paint output sits in the frame before. A view that did not paint in that frame
-    /// has none.
-    Reused {
-        paint: Option<Range<PaintIndex>>,
-    },
+    Reused { paint: Range<PaintIndex> },
     Replayed(Replay),
 }
 
@@ -71,7 +67,8 @@ struct ViewElementState {
     /// cached view, or inside a deferred draw: the range can then be older than the frame before. It is of the
     /// frame being drawn in a second prepaint, after [`Window::transact`] threw the first away.
     prepainted_in: u64,
-    /// The frame `paint_range` is of. A view is prepainted without being painted while it is hidden.
+    /// The frame `paint_range` and the retained scene are of. A view is prepainted without being painted while it
+    /// is hidden: nothing is then carried over, because the scene may be older than what the view rendered last.
     painted_in: u64,
     /// The frame the view last rendered or replayed in, which is the frame it last drew its slots in.
     drew_slots_in: u64,
@@ -168,7 +165,7 @@ impl RetainedPaint {
 enum Plan {
     Reuse {
         prepaint: Range<PrepaintStateIndex>,
-        paint: Option<Range<PaintIndex>>,
+        paint: Range<PaintIndex>,
     },
     Replay(ReplayPlan),
     Render,
@@ -203,26 +200,20 @@ impl ViewElementState {
         let Some(carried_from) = CarriedFrom::current(window) else {
             return Plan::Render;
         };
-        if self.prepainted_in != carried_from.drawn_in {
+        if self.prepainted_in != carried_from.drawn_in || self.painted_in != carried_from.drawn_in {
             return Plan::Render;
         }
         let prepaint = carried_from.prepaint_range(&self.prepaint_range);
-        if !window.rendered_frame_holds_prepaint(&prepaint) {
+        let paint = carried_from.paint_range(&self.paint_range);
+        if !window.rendered_frame_holds_prepaint(&prepaint)
+            || !window.rendered_frame_holds_paint(&paint)
+        {
             return Plan::Render;
         }
-        let paint = if self.painted_in == carried_from.drawn_in {
-            let paint = carried_from.paint_range(&self.paint_range);
-            if !window.rendered_frame_holds_paint(&paint) {
-                return Plan::Render;
-            }
-            Some(paint)
-        } else {
-            None
-        };
         if !window.dirty_views.contains(&entity_id) {
             return Plan::Reuse { prepaint, paint };
         }
-        match paint.and_then(|paint| self.replay_plan(entity_id, prepaint, paint, window)) {
+        match self.replay_plan(entity_id, prepaint, paint, window) {
             Some(plan) => Plan::Replay(plan),
             None => Plan::Render,
         }
@@ -370,7 +361,6 @@ pub(crate) fn paint(
         };
 
         let paint_start = window.paint_index();
-        let mut painted = true;
         match &mut prepaint.0 {
             Outcome::Rendered(element) => {
                 let frame = PaintFrame::new(paint_start.clone(), window, cx);
@@ -383,15 +373,9 @@ pub(crate) fn paint(
                 state.own_reads.extend(own_reads);
                 state.finish_paint(outer_scene, window);
             }
-            Outcome::Reused { paint: Some(paint) } => {
+            Outcome::Reused { paint } => {
                 window.reuse_paint_except_scene(paint.clone());
                 state.retained.kept_clean();
-            }
-            Outcome::Reused { paint: None } => {
-                // The frame before has no listeners of the view to carry over. Its scene still shows it, and it
-                // renders in the next frame for the rest.
-                window.on_next_frame(move |_, cx| cx.notify(entity_id));
-                painted = false;
             }
             Outcome::Replayed(replay) => {
                 let frame = PaintFrame::new(paint_start.clone(), window, cx);
@@ -407,9 +391,7 @@ pub(crate) fn paint(
         }
 
         let paint_end = window.paint_index();
-        if painted {
-            state.painted_in = window.frame_number;
-        }
+        state.painted_in = window.frame_number;
         let base = record_paint(entity_id, slot_start..paint_end.clone(), window, cx);
         state.paint_range = relative_paint(paint_start..paint_end, &base);
         ((), state)
