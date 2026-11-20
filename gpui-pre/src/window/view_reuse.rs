@@ -167,15 +167,8 @@ impl Window {
         range.start.deferred_draws_index != range.end.deferred_draws_index
     }
 
-    /// Like [`Window::reuse_prepaint`] for a run of a cached view's own output between the cached views inside it:
-    /// the dispatch nodes of the run stay open on `open_nodes`, so that what the next cached view prepaints goes
-    /// under the node it went under. Returns that node, the last of the run, if the run has one. Close the last run
-    /// with [`Window::close_reused_nodes`]. The range must hold no deferred draws.
-    pub(crate) fn reuse_prepaint_open(
-        &mut self,
-        range: Range<PrepaintStateIndex>,
-        open_nodes: &mut Vec<DispatchNodeId>,
-    ) -> Option<DispatchNodeId> {
+    /// Carries over what a prepaint range holds outside the dispatch tree and the deferred draws.
+    pub(super) fn reuse_prepaint_buffers(&mut self, range: &Range<PrepaintStateIndex>) {
         self.next_frame.hitboxes.extend(
             self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]
                 .iter()
@@ -193,8 +186,21 @@ impl Window {
                 .iter()
                 .map(|(id, type_id)| (id.clone(), *type_id)),
         );
-        self.text_system
-            .reuse_layouts(range.start.line_layout_index..range.end.line_layout_index);
+        self.text_system.reuse_layouts(
+            range.start.line_layout_index.clone()..range.end.line_layout_index.clone(),
+        );
+    }
+
+    /// Like [`Window::reuse_prepaint`] for a run of a cached view's own output between the cached views inside it:
+    /// the dispatch nodes of the run stay open on `open_nodes`, so that what the next cached view prepaints goes
+    /// under the node it went under. Returns that node, the last of the run, if the run has one. Close the last run
+    /// with [`Window::close_reused_nodes`]. The range must hold no deferred draws.
+    pub(crate) fn reuse_prepaint_open(
+        &mut self,
+        range: Range<PrepaintStateIndex>,
+        open_nodes: &mut Vec<DispatchNodeId>,
+    ) -> Option<DispatchNodeId> {
+        self.reuse_prepaint_buffers(&range);
 
         let nodes = range.start.dispatch_tree_index..range.end.dispatch_tree_index;
         let has_nodes = !nodes.is_empty();

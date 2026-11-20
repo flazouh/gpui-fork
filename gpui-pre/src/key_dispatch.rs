@@ -269,34 +269,10 @@ impl DispatchTree {
     ) -> ReusedSubtree {
         let new_range = self.nodes.len()..self.nodes.len() + old_range.len();
 
-        let mut contains_focus = false;
-        let mut source_stack = vec![];
-        for (source_node_id, source_node) in source
-            .nodes
-            .iter_mut()
-            .enumerate()
-            .skip(old_range.start)
-            .take(old_range.len())
-        {
-            let source_node_id = DispatchNodeId(source_node_id);
-            while let Some(source_ancestor) = source_stack.last() {
-                if source_node.parent == Some(*source_ancestor) {
-                    break;
-                } else {
-                    source_stack.pop();
-                    self.pop_node();
-                }
-            }
-
-            source_stack.push(source_node_id);
-            if source_node.focus_id.is_some() && source_node.focus_id == focus {
-                contains_focus = true;
-            }
-            self.move_node(source_node);
-        }
-
-        while !source_stack.is_empty() {
-            source_stack.pop();
+        let mut open_nodes = Vec::new();
+        let contains_focus =
+            self.reuse_nodes_open(old_range.clone(), source, focus, &mut open_nodes);
+        for _ in open_nodes {
             self.pop_node();
         }
 
@@ -307,9 +283,9 @@ impl DispatchTree {
         }
     }
 
-    /// Moves the nodes of `old_range` from `source` as [`DispatchTree::reuse_subtree`] does, leaving the ones that
-    /// are still open at the end on `open_nodes` (by their ids in `source`) and pushed, so another run can go on
-    /// from where this one stopped. Returns whether a moved node has the focus.
+    /// Moves the nodes of `old_range` from `source`. The ones still open at the end stay pushed, and on
+    /// `open_nodes` by their ids in `source`, so that another run goes on from where this one stopped. Returns
+    /// whether a moved node has the focus.
     pub fn reuse_nodes_open(
         &mut self,
         old_range: Range<usize>,
