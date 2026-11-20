@@ -2378,22 +2378,26 @@ impl Interactivity {
                     }
                 }
 
-                window.with_text_style(style.text_style().cloned(), |window| {
-                    window.with_content_mask(
-                        style.overflow_mask(bounds, window.rem_size()),
-                        |window| {
-                            let hitbox = if self.should_insert_hitbox(&style, window, cx) {
-                                Some(window.insert_hitbox(bounds, self.hitbox_behavior))
-                            } else {
-                                None
-                            };
+                // Nothing is painted here. The opacity is set so that a cached view inside sees, in prepaint,
+                // the opacity it will be painted with, and renders again when that changes.
+                window.with_element_opacity(style.opacity, |window| {
+                    window.with_text_style(style.text_style().cloned(), |window| {
+                        window.with_content_mask(
+                            style.overflow_mask(bounds, window.rem_size()),
+                            |window| {
+                                let hitbox = if self.should_insert_hitbox(&style, window, cx) {
+                                    Some(window.insert_hitbox(bounds, self.hitbox_behavior))
+                                } else {
+                                    None
+                                };
 
-                            let scroll_offset =
-                                self.clamp_scroll_position(bounds, &style, window, cx);
-                            let result = f(&style, scroll_offset, hitbox, window, cx);
-                            (result, element_state)
-                        },
-                    )
+                                let scroll_offset =
+                                    self.clamp_scroll_position(bounds, &style, window, cx);
+                                let result = f(&style, scroll_offset, hitbox, window, cx);
+                                (result, element_state)
+                            },
+                        )
+                    })
                 })
             },
         )
@@ -4051,29 +4055,37 @@ fn handle_tooltip_check_visible_and_update(
 }
 
 #[derive(Default)]
-pub(crate) struct GroupHitboxes(HashMap<SharedString, SmallVec<[HitboxId; 1]>>);
+pub(crate) struct GroupHitboxes {
+    hitboxes: HashMap<SharedString, SmallVec<[HitboxId; 1]>>,
+    active: usize,
+}
 
 impl Global for GroupHitboxes {}
 
 impl GroupHitboxes {
     pub fn get(name: &SharedString, cx: &mut App) -> Option<HitboxId> {
         cx.default_global::<Self>()
-            .0
+            .hitboxes
             .get(name)
             .and_then(|bounds_stack| bounds_stack.last())
             .cloned()
     }
 
     pub fn push(name: SharedString, hitbox_id: HitboxId, cx: &mut App) {
-        cx.default_global::<Self>()
-            .0
-            .entry(name)
-            .or_default()
-            .push(hitbox_id);
+        let groups = cx.default_global::<Self>();
+        groups.hitboxes.entry(name).or_default().push(hitbox_id);
+        groups.active += 1;
     }
 
     pub fn pop(name: &SharedString, cx: &mut App) {
-        cx.default_global::<Self>().0.get_mut(name).unwrap().pop();
+        let groups = cx.default_global::<Self>();
+        groups.hitboxes.get_mut(name).unwrap().pop();
+        groups.active -= 1;
+    }
+
+    /// How many groups are being painted. What paints inside one may read its hitbox.
+    pub fn active(cx: &mut App) -> usize {
+        cx.default_global::<Self>().active
     }
 }
 

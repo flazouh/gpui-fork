@@ -307,6 +307,40 @@ impl DispatchTree {
         }
     }
 
+    /// Moves the nodes of `old_range` from `source` as [`DispatchTree::reuse_subtree`] does, leaving the ones that
+    /// are still open at the end on `open_nodes` (by their ids in `source`) and pushed, so another run can go on
+    /// from where this one stopped. Returns whether a moved node has the focus.
+    pub fn reuse_nodes_open(
+        &mut self,
+        old_range: Range<usize>,
+        source: &mut Self,
+        focus: Option<FocusId>,
+        open_nodes: &mut Vec<DispatchNodeId>,
+    ) -> bool {
+        let mut contains_focus = false;
+        for (source_node_id, source_node) in source
+            .nodes
+            .iter_mut()
+            .enumerate()
+            .skip(old_range.start)
+            .take(old_range.len())
+        {
+            while let Some(source_ancestor) = open_nodes.last() {
+                if source_node.parent == Some(*source_ancestor) {
+                    break;
+                }
+                open_nodes.pop();
+                self.pop_node();
+            }
+            open_nodes.push(DispatchNodeId(source_node_id));
+            if source_node.focus_id.is_some() && source_node.focus_id == focus {
+                contains_focus = true;
+            }
+            self.move_node(source_node);
+        }
+        contains_focus
+    }
+
     pub fn truncate(&mut self, index: usize) {
         for node in &self.nodes[index..] {
             if let Some(focus_id) = node.focus_id {

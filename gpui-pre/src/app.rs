@@ -1213,6 +1213,19 @@ impl App {
         (result, entities_accessed_in_callback)
     }
 
+    /// Runs `callback` and returns the entities it read or updated, itself: what a scope opened inside it reads is
+    /// that scope's alone. Unlike [`App::detect_accessed_entities`], an entity that something read earlier in the
+    /// frame still counts.
+    pub(crate) fn with_read_scope<R>(
+        &mut self,
+        callback: impl FnOnce(&mut App) -> R,
+    ) -> (R, FxHashSet<EntityId>) {
+        let outer = self.entities.swap_read_scope(Some(FxHashSet::default()));
+        let result = callback(self);
+        let reads = self.entities.swap_read_scope(outer).unwrap_or_default();
+        (result, reads)
+    }
+
     pub(crate) fn record_entities_accessed(
         &mut self,
         window_handle: AnyWindowHandle,

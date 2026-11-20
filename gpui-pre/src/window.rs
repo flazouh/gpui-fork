@@ -65,6 +65,7 @@ use uuid::Uuid;
 
 pub(crate) mod a11y;
 mod prompts;
+mod view_reuse;
 
 pub use a11y::A11ySubtreeBuilder;
 
@@ -1195,6 +1196,16 @@ pub struct Window {
     tooltip_anchor: Option<TooltipAnchor>,
     pub(crate) next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
     pub(crate) dirty_views: FxHashSet<EntityId>,
+    /// Every entity notified for this frame: `dirty_views` without the ancestors it adds.
+    pub(crate) self_dirty_views: FxHashSet<EntityId>,
+    /// The cached views that are rendering or replaying their prepaint, innermost last.
+    pub(crate) cached_view_prepaints: Vec<crate::retained_view::PrepaintFrame>,
+    /// The cached views that are painting what they rendered or replayed, innermost last.
+    pub(crate) cached_view_paints: Vec<crate::retained_view::PaintFrame>,
+    /// How many [`Window::paint_group`] calls are painting, each into a scene of its own.
+    pub(crate) group_depth: usize,
+    /// Frames drawn so far, this one included while it is drawn.
+    pub(crate) frame_number: u64,
     focus_listeners: SubscriberSet<(), AnyWindowFocusListener>,
     pub(crate) focus_lost_listeners: SubscriberSet<(), AnyObserver>,
     focus_lost_path: SmallVec<[FocusId; 8]>,
@@ -2052,6 +2063,11 @@ impl Window {
             tooltip_bounds: None,
             tooltip_anchor: None,
             dirty_views: FxHashSet::default(),
+            self_dirty_views: FxHashSet::default(),
+            cached_view_prepaints: Vec::new(),
+            cached_view_paints: Vec::new(),
+            group_depth: 0,
+            frame_number: 0,
             focus_listeners: SubscriberSet::new(),
             focus_lost_listeners: SubscriberSet::new(),
             focus_lost_path: SmallVec::new(),
@@ -3279,6 +3295,7 @@ impl Window {
         if self.platform_window.prepare_frame() {
             self.refresh();
         }
+        self.frame_number += 1;
         self.invalidate_entities();
         cx.entities.clear_accessed();
         debug_assert!(self.rendered_entity_stack.is_empty());
@@ -3316,6 +3333,7 @@ impl Window {
             }
         }
         self.dirty_views.clear();
+        self.self_dirty_views.clear();
         self.next_frame.window_active = self.active.get();
 
         // Register requested input handler with the platform window.
@@ -3436,6 +3454,7 @@ impl Window {
 
     fn invalidate_entities(&mut self) {
         let mut views = self.invalidator.take_views();
+        self.self_dirty_views.extend(views.iter().copied());
         for entity in views.drain() {
             self.mark_view_dirty(entity);
         }
@@ -3893,6 +3912,16 @@ impl Window {
     }
 
     pub(crate) fn reuse_paint(&mut self, range: Range<PaintIndex>) {
+        let scene_range = range.start.scene_index..range.end.scene_index;
+        self.reuse_paint_except_scene(range);
+        self.next_frame
+            .scene
+            .replay(scene_range, &self.rendered_frame.scene);
+    }
+
+    /// Carries over from the last frame what [`Window::reuse_paint`] does, except the scene: a cached view puts its
+    /// own scene on the frame.
+    pub(crate) fn reuse_paint_except_scene(&mut self, range: Range<PaintIndex>) {
         // Cached elements still exist in the frame even when their paint methods don't run.
         #[cfg(any(test, feature = "test-support"))]
         for (selector, bounds) in &self.rendered_frame.debug_bounds_records
@@ -3932,10 +3961,6 @@ impl Window {
 
         self.text_system
             .reuse_layouts(range.start.line_layout_index..range.end.line_layout_index);
-        self.next_frame.scene.replay(
-            range.start.scene_index..range.end.scene_index,
-            &self.rendered_frame.scene,
-        );
     }
 
     /// Push a text style onto the stack, and call a function with that style active.
@@ -4075,8 +4100,17 @@ impl Window {
     pub fn transact<T, U>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, U>) -> Result<T, U> {
         self.invalidator.debug_assert_prepaint();
         let index = self.prepaint_index();
+        let recorded_views = self
+            .cached_view_prepaints
+            .last()
+            .map(|frame| frame.recorded_views());
         let result = f(self);
         if result.is_err() {
+            if let (Some(frame), Some(recorded_views)) =
+                (self.cached_view_prepaints.last_mut(), recorded_views)
+            {
+                frame.forget_views_after(recorded_views);
+            }
             self.next_frame.hitboxes.truncate(index.hitboxes_index);
             self.next_frame
                 .tooltip_requests
@@ -4413,6 +4447,19 @@ impl Window {
     /// [`Window::paint_group`] with a mask: what `mask` paints is a second scene, and the group shows where that is
     /// opaque, in proportion to its alpha (CSS `mask-image` with an alpha mask). `bounds` is the area both cover.
     pub fn paint_group_masked<R>(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        effects: crate::GroupEffects,
+        f: impl FnOnce(&mut Self) -> R,
+        mask: Option<impl FnOnce(&mut Self)>,
+    ) -> R {
+        self.group_depth += 1;
+        let result = self.paint_group_scenes(bounds, effects, f, mask);
+        self.group_depth -= 1;
+        result
+    }
+
+    fn paint_group_scenes<R>(
         &mut self,
         bounds: Bounds<Pixels>,
         effects: crate::GroupEffects,

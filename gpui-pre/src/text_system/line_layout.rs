@@ -492,6 +492,39 @@ pub(crate) struct LineLayoutIndex {
     wrapped_lines_by_hash_index: usize,
 }
 
+impl LineLayoutIndex {
+    /// This index, counted from `base`, counted from where `base` counts from. The font generation stays the one
+    /// the index was taken in.
+    pub(crate) fn offset_by(&self, base: &Self) -> Self {
+        Self {
+            font_generation: self.font_generation,
+            lines_index: base.lines_index + self.lines_index,
+            wrapped_lines_index: base.wrapped_lines_index + self.wrapped_lines_index,
+            lines_by_hash_index: base.lines_by_hash_index + self.lines_by_hash_index,
+            wrapped_lines_by_hash_index: base.wrapped_lines_by_hash_index
+                + self.wrapped_lines_by_hash_index,
+        }
+    }
+
+    /// This index counted from `base`. A frame that clears the cache for a new font generation can leave it before
+    /// `base`: the counts then come out as zero, and [`LineLayoutCache::holds_layouts`] refuses a range they spoil.
+    pub(crate) fn relative_to(&self, base: &Self) -> Self {
+        Self {
+            font_generation: self.font_generation,
+            lines_index: self.lines_index.saturating_sub(base.lines_index),
+            wrapped_lines_index: self
+                .wrapped_lines_index
+                .saturating_sub(base.wrapped_lines_index),
+            lines_by_hash_index: self
+                .lines_by_hash_index
+                .saturating_sub(base.lines_by_hash_index),
+            wrapped_lines_by_hash_index: self
+                .wrapped_lines_by_hash_index
+                .saturating_sub(base.wrapped_lines_by_hash_index),
+        }
+    }
+}
+
 impl LineLayoutCache {
     pub fn new(
         platform_text_system: Arc<dyn PlatformTextSystem>,
@@ -562,6 +595,36 @@ impl LineLayoutCache {
             }
             current_frame.used_wrapped_lines_by_hash.push(key.clone());
         }
+    }
+
+    /// Whether [`Self::reuse_layouts`] can take `range` from the frame before: it is in order and within what that
+    /// frame used. A range of another font generation holds, since nothing of it is taken.
+    pub fn holds_layouts(&self, range: &Range<LineLayoutIndex>) -> bool {
+        let font_generation = self.clear_if_font_generation_changed();
+        if range.start.font_generation != font_generation
+            || range.end.font_generation != font_generation
+        {
+            return true;
+        }
+        let previous_frame = self.previous_frame.lock();
+        let within = |start: usize, end: usize, len: usize| start <= end && end <= len;
+        within(
+            range.start.lines_index,
+            range.end.lines_index,
+            previous_frame.used_lines.len(),
+        ) && within(
+            range.start.wrapped_lines_index,
+            range.end.wrapped_lines_index,
+            previous_frame.used_wrapped_lines.len(),
+        ) && within(
+            range.start.lines_by_hash_index,
+            range.end.lines_by_hash_index,
+            previous_frame.used_lines_by_hash.len(),
+        ) && within(
+            range.start.wrapped_lines_by_hash_index,
+            range.end.wrapped_lines_by_hash_index,
+            previous_frame.used_wrapped_lines_by_hash.len(),
+        )
     }
 
     pub fn truncate_layouts(&self, index: LineLayoutIndex) {
